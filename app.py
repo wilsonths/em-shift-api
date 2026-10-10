@@ -16,6 +16,7 @@ app.add_middleware(
 
 KNOWN_ZONES = ['R1', 'R2A', 'R2B', 'Y/TL', 'YS', 'Y/C', 'Y', 'Y2', 'GZ', 'GS', 'REG']
 DAYS_OF_WEEK = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY']
+NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE']
 
 def match_exact_name(source_text: str, target_name: str) -> bool:
     if not source_text or not target_name:
@@ -93,6 +94,7 @@ async def parse_roster(
                         name_words = [w for w in row_words if match_exact_name(w['text'], target_name)]
                         name_x = name_words[0]['x0'] if name_words else row_words[0]['x0']
 
+                        # Determine shift type based on closest header column
                         matched_shift = "AM"
                         if shift_cols:
                             best_col = min(shift_cols, key=lambda c: abs((c['x0'] + c['x1'])/2 - name_x))
@@ -102,12 +104,25 @@ async def parse_roster(
                             elif "NIGHT" in row_full_text.upper() or " N " in row_full_text.upper(): matched_shift = "N"
                             elif "SD" in row_full_text.upper(): matched_shift = "SD"
 
-                        detected_zone = next((z for z in KNOWN_ZONES if z in row_full_text.upper()), "")
+                        # Determine Zone: STRICTLY CLEAR for non-working shifts
+                        detected_zone = ""
+                        if matched_shift not in NO_ZONE_SHIFTS:
+                            # Search for zone labels ONLY within close horizontal proximity to user's name
+                            nearby_words = [
+                                w['text'].upper() for w in row_words 
+                                if abs(w['x0'] - name_x) < 45
+                            ]
+                            nearby_text = " ".join(nearby_words)
+                            
+                            for z in KNOWN_ZONES:
+                                if z in nearby_text:
+                                    detected_zone = z;
+                                    break
 
                         start_time, end_time = "08:00", "16:00"
                         if matched_shift == 'PM': start_time, end_time = "14:00", "22:00"
                         elif matched_shift == 'N': start_time, end_time = "21:00", "09:00"
-                        elif matched_shift in ['SD', 'OD', 'AL', 'MC']: start_time, end_time = "", ""
+                        elif matched_shift in NO_ZONE_SHIFTS: start_time, end_time = "", ""
 
                         extracted_results.append({
                             "date": target_date,
