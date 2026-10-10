@@ -22,11 +22,9 @@ KNOWN_ZONES = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS',
 WORKING_SHIFTS = ['AM', 'PM', 'N', 'NIGHT']
 NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', 'OFF', 'REST', 'SL']
 
-# Column indices for the 7 horizontal day blocks (A, H, O, V, AC, AJ, AQ)
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
-    # Try direct Google Sheets CSV export first
     url1 = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&sheet={tab_name}"
     try:
         r = requests.get(url1, timeout=10)
@@ -34,9 +32,8 @@ def fetch_sheet_csv(tab_name: str):
             r.encoding = 'utf-8'
             return list(csv.reader(io.StringIO(r.text)))
     except Exception as e:
-        print(f"Export CSV fetch failed, falling back to GViz: {e}")
+        print(f"Export CSV fetch failed: {e}")
 
-    # Fallback to GViz Query API
     url2 = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}"
     r = requests.get(url2, timeout=10)
     r.encoding = 'utf-8'
@@ -61,7 +58,6 @@ def parse_date_string(text: str) -> str:
     if not text: return ""
     text = text.strip()
 
-    # 1. Google Viz Date format: Date(2026, 9, 12)
     m = re.search(r'Date\((\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\)', text)
     if m:
         y = int(m.group(1))
@@ -69,12 +65,10 @@ def parse_date_string(text: str) -> str:
         d = int(m.group(3))
         return f"{y:04d}-{m_idx:02d}-{d:02d}"
 
-    # 2. ISO Format: YYYY-MM-DD
     m = re.search(r'\b(20\d\d)[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12][0-9]|3[01])\b', text)
     if m:
         return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
 
-    # 3. Standard UK/MY Date format: DD/MM/YYYY or DD/MM/YY or DD-MM-YYYY
     m = re.search(r'\b(0?[1-9]|[12][0-9]|3[01])[/.-](0?[1-9]|1[0-2])(?:[/.-](20\d\d|\d\d))?\b', text)
     if m:
         day = m.group(1).zfill(2)
@@ -83,7 +77,6 @@ def parse_date_string(text: str) -> str:
         year = raw_year if (raw_year and len(raw_year) == 4) else ("20" + raw_year if raw_year else "2026")
         return f"{year}-{month}-{day}"
 
-    # 4. Text format: 12 Oct / 12-Oct
     m = re.search(r'\b(0?[1-9]|[12][0-9]|3[01])[\s\-_](JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*\b', text, re.IGNORECASE)
     if m:
         day = m.group(1).zfill(2)
@@ -121,8 +114,6 @@ def sync_roster(user_name: str = Form(...)):
     try:
         weekly_sheet = fetch_sheet_csv("Weekly")
         if len(weekly_sheet) >= 1:
-            
-            # --- AGGRESSIVE DATE SEARCH ACROSS TOP 20 ROWS ---
             base_date_dt = None
             for r_idx in range(min(20, len(weekly_sheet))):
                 row_data = weekly_sheet[r_idx]
@@ -145,7 +136,6 @@ def sync_roster(user_name: str = Form(...)):
 
             block_dates = [(base_date_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
 
-            # --- PROCESS EACH DAY BLOCK INDEPENDENTLY ---
             for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
                 assigned_date = block_dates[b_idx]
                 current_shift = "AM"
@@ -201,13 +191,13 @@ def sync_roster(user_name: str = Form(...)):
     except Exception as e:
         print(f"Weekly Sheet Error: {e}")
 
-    # 3. READ MONTHLY LOCUM TAB
+    # 3. READ MONTHLY LOCUM TAB (ENHANCED RANGE SCAN)
     try:
         locum_sheet = fetch_sheet_csv("Locum")
-        if len(locum_sheet) > 1:
-            header_text = " ".join(locum_sheet[0]).upper()
-            target_month = "10"
-            target_year = "2026"
+        if len(locum_sheet) > 0:
+            header_text = " ".join([" ".join(r) for r in locum_sheet[:5]]).upper()
+            target_month = datetime.now().strftime("%m")
+            target_year = datetime.now().strftime("%Y")
             
             month_match = re.search(r'\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\b', header_text)
             if month_match:
@@ -228,16 +218,20 @@ def sync_roster(user_name: str = Form(...)):
             for row in locum_sheet[1:]:
                 if not row: continue
 
-                # LEFT BLOCK (Cols A-E)
-                d_left = re.search(r'\b([1-3]?[0-9])\b', row[0]) if len(row) > 0 else None
-                if d_left: last_date_left = d_left.group(1).zfill(2)
+                # LEFT BLOCK (Cols A-F: idx 0 to 5)
+                if len(row) > 0 and row[0].strip():
+                    d_left = re.search(r'\b([1-3]?[0-9])\b', row[0])
+                    if d_left:
+                        val = int(d_left.group(1))
+                        if 1 <= val <= 31: last_date_left = str(val).zfill(2)
 
-                t_left = row[2].upper() if len(row) > 2 else ""
-                if "10" in t_left: last_time_left = ("10:00", "14:00")
-                elif "2" in t_left: last_time_left = ("14:00", "18:00")
-                elif "7" in t_left: last_time_left = ("19:00", "23:00")
+                if len(row) > 2 and row[2].strip():
+                    t_left = row[2].upper()
+                    if "10" in t_left: last_time_left = ("10:00", "14:00")
+                    elif "2" in t_left: last_time_left = ("14:00", "18:00")
+                    elif "7" in t_left or "19" in t_left: last_time_left = ("19:00", "23:00")
 
-                left_names = " ".join(row[3:5]) if len(row) >= 5 else ""
+                left_names = " ".join(row[3:6]) if len(row) >= 4 else ""
                 if match_exact_name(left_names, locum_name):
                     results.append({
                         "date": f"{target_year}-{target_month}-{last_date_left}",
@@ -249,16 +243,20 @@ def sync_roster(user_name: str = Form(...)):
                         "isLocum": True
                     })
 
-                # RIGHT BLOCK (Cols G-K)
-                d_right = re.search(r'\b([1-3]?[0-9])\b', row[6]) if len(row) > 6 else None
-                if d_right: last_date_right = d_right.group(1).zfill(2)
+                # RIGHT BLOCK (Cols G-L: idx 6 to 11)
+                if len(row) > 6 and row[6].strip():
+                    d_right = re.search(r'\b([1-3]?[0-9])\b', row[6])
+                    if d_right:
+                        val_r = int(d_right.group(1))
+                        if 1 <= val_r <= 31: last_date_right = str(val_r).zfill(2)
 
-                t_right = row[8].upper() if len(row) > 8 else ""
-                if "10" in t_right: last_time_right = ("10:00", "14:00")
-                elif "2" in t_right: last_time_right = ("14:00", "18:00")
-                elif "7" in t_right: last_time_right = ("19:00", "23:00")
+                if len(row) > 8 and row[8].strip():
+                    t_right = row[8].upper()
+                    if "10" in t_right: last_time_right = ("10:00", "14:00")
+                    elif "2" in t_right: last_time_right = ("14:00", "18:00")
+                    elif "7" in t_right or "19" in t_right: last_time_right = ("19:00", "23:00")
 
-                right_names = " ".join(row[9:11]) if len(row) >= 11 else ""
+                right_names = " ".join(row[9:12]) if len(row) >= 10 else ""
                 if match_exact_name(right_names, locum_name):
                     results.append({
                         "date": f"{target_year}-{target_month}-{last_date_right}",
