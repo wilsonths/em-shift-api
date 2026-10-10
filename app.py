@@ -17,7 +17,6 @@ app.add_middleware(
 )
 
 SHEET_ID = "1tNxIC97VlR1LKxRIqoKHpJnzcssua_FTH8Y1wLEp6cg"
-CSV_BASE_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet="
 
 KNOWN_ZONES = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS', 'Y']
 WORKING_SHIFTS = ['AM', 'PM', 'N', 'NIGHT']
@@ -27,9 +26,21 @@ NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', '
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
-    response = requests.get(CSV_BASE_URL + tab_name)
-    response.encoding = 'utf-8'
-    return list(csv.reader(io.StringIO(response.text)))
+    # Try direct Google Sheets CSV export first
+    url1 = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&sheet={tab_name}"
+    try:
+        r = requests.get(url1, timeout=10)
+        if r.status_code == 200 and len(r.text) > 10:
+            r.encoding = 'utf-8'
+            return list(csv.reader(io.StringIO(r.text)))
+    except Exception as e:
+        print(f"Export CSV fetch failed, falling back to GViz: {e}")
+
+    # Fallback to GViz Query API
+    url2 = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}"
+    r = requests.get(url2, timeout=10)
+    r.encoding = 'utf-8'
+    return list(csv.reader(io.StringIO(r.text)))
 
 def match_exact_name(cell_text: str, target_name: str) -> bool:
     if not cell_text or not target_name:
@@ -49,13 +60,21 @@ def extract_zone(text: str) -> str:
 def parse_date_string(text: str) -> str:
     if not text: return ""
     text = text.strip()
-    
-    # Format 1: YYYY-MM-DD
+
+    # 1. Google Viz Date format: Date(2026, 9, 12)
+    m = re.search(r'Date\((\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\)', text)
+    if m:
+        y = int(m.group(1))
+        m_idx = int(m.group(2)) + 1
+        d = int(m.group(3))
+        return f"{y:04d}-{m_idx:02d}-{d:02d}"
+
+    # 2. ISO Format: YYYY-MM-DD
     m = re.search(r'\b(20\d\d)[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12][0-9]|3[01])\b', text)
     if m:
         return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
 
-    # Format 2: DD/MM/YYYY or DD/MM/YY or DD/MM
+    # 3. Standard UK/MY Date format: DD/MM/YYYY or DD/MM/YY or DD-MM-YYYY
     m = re.search(r'\b(0?[1-9]|[12][0-9]|3[01])[/.-](0?[1-9]|1[0-2])(?:[/.-](20\d\d|\d\d))?\b', text)
     if m:
         day = m.group(1).zfill(2)
@@ -64,7 +83,7 @@ def parse_date_string(text: str) -> str:
         year = raw_year if (raw_year and len(raw_year) == 4) else ("20" + raw_year if raw_year else "2026")
         return f"{year}-{month}-{day}"
 
-    # Format 3: DD Mon (e.g., 12 Oct or 12-Oct)
+    # 4. Text format: 12 Oct / 12-Oct
     m = re.search(r'\b(0?[1-9]|[12][0-9]|3[01])[\s\-_](JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*\b', text, re.IGNORECASE)
     if m:
         day = m.group(1).zfill(2)
@@ -101,30 +120,28 @@ def sync_roster(user_name: str = Form(...)):
     # 2. READ WEEKLY SHIFT TAB
     try:
         weekly_sheet = fetch_sheet_csv("Weekly")
-        if len(weekly_sheet) >= 10:
+        if len(weekly_sheet) >= 1:
             
-            # --- BASE DATE EXTRACTION ---
+            # --- AGGRESSIVE DATE SEARCH ACROSS TOP 20 ROWS ---
             base_date_dt = None
-            for r_idx in [9, 10, 8]:
-                if r_idx < len(weekly_sheet):
-                    row_data = weekly_sheet[r_idx]
-                    for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
-                        for col_offset in [1, 0, 2]:
-                            cell_idx = block_col + col_offset
-                            if cell_idx < len(row_data):
-                                parsed = parse_date_string(row_data[cell_idx])
-                                if parsed:
-                                    try:
-                                        found_dt = datetime.strptime(parsed, "%Y-%m-%d")
-                                        base_date_dt = found_dt - timedelta(days=b_idx)
-                                        break
-                                    except ValueError:
-                                        pass
-                        if base_date_dt: break
-                if base_date_dt: break
+            for r_idx in range(min(20, len(weekly_sheet))):
+                row_data = weekly_sheet[r_idx]
+                for c_idx, cell in enumerate(row_data):
+                    parsed = parse_date_string(cell)
+                    if parsed:
+                        try:
+                            found_dt = datetime.strptime(parsed, "%Y-%m-%d")
+                            b_idx = min(c_idx // 7, 6)
+                            base_date_dt = found_dt - timedelta(days=b_idx)
+                            break
+                        except ValueError:
+                            pass
+                if base_date_dt:
+                    break
 
             if not base_date_dt:
-                base_date_dt = datetime(2026, 10, 5)
+                today = datetime.now()
+                base_date_dt = today - timedelta(days=today.weekday())
 
             block_dates = [(base_date_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
 
@@ -133,12 +150,10 @@ def sync_roster(user_name: str = Form(...)):
                 assigned_date = block_dates[b_idx]
                 current_shift = "AM"
 
-                # Scan from Row 12 downwards (index 11)
                 for r_idx in range(11, len(weekly_sheet)):
                     row = weekly_sheet[r_idx]
                     if not row: continue
 
-                    # Update shift tracking if a shift header is present in the block's main column
                     if block_col < len(row):
                         shift_cell = row[block_col].upper().strip()
                         if shift_cell:
@@ -153,7 +168,6 @@ def sync_roster(user_name: str = Form(...)):
                             elif "OFF" in shift_cell or "REST" in shift_cell: current_shift = "OFF"
                             elif "LEAVE" in shift_cell: current_shift = "LEAVE"
 
-                    # Scan all sub-columns inside this day block (block_col to block_col + 6)
                     block_cells = row[block_col : min(block_col + 7, len(row))]
                     block_text = " ".join(block_cells)
 
@@ -182,7 +196,7 @@ def sync_roster(user_name: str = Form(...)):
                             "endTime": e_time,
                             "isLocum": False
                         })
-                        break # Done with this day block
+                        break
 
     except Exception as e:
         print(f"Weekly Sheet Error: {e}")
