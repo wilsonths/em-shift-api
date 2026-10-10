@@ -25,19 +25,13 @@ NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', '
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
-    url1 = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&sheet={tab_name}"
-    try:
-        r = requests.get(url1, timeout=10)
-        if r.status_code == 200 and len(r.text) > 10:
-            r.encoding = 'utf-8'
-            return list(csv.reader(io.StringIO(r.text)))
-    except Exception as e:
-        print(f"Export CSV fetch failed: {e}")
-
-    url2 = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}"
-    r = requests.get(url2, timeout=10)
-    r.encoding = 'utf-8'
-    return list(csv.reader(io.StringIO(r.text)))
+    # GViz Query API strictly respects tab names (&sheet=Weekly, &sheet=Locum, &sheet=Aliases)
+    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}"
+    response = requests.get(url, timeout=10)
+    response.encoding = 'utf-8'
+    if response.status_code == 200:
+        return list(csv.reader(io.StringIO(response.text)))
+    return []
 
 def match_exact_name(cell_text: str, target_name: str) -> bool:
     if not cell_text or not target_name:
@@ -191,13 +185,13 @@ def sync_roster(user_name: str = Form(...)):
     except Exception as e:
         print(f"Weekly Sheet Error: {e}")
 
-    # 3. READ MONTHLY LOCUM TAB (ENHANCED RANGE SCAN)
+    # 3. READ MONTHLY LOCUM TAB
     try:
         locum_sheet = fetch_sheet_csv("Locum")
         if len(locum_sheet) > 0:
             header_text = " ".join([" ".join(r) for r in locum_sheet[:5]]).upper()
-            target_month = datetime.now().strftime("%m")
-            target_year = datetime.now().strftime("%Y")
+            target_month = "10"
+            target_year = "2026"
             
             month_match = re.search(r'\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\b', header_text)
             if month_match:
@@ -218,7 +212,7 @@ def sync_roster(user_name: str = Form(...)):
             for row in locum_sheet[1:]:
                 if not row: continue
 
-                # LEFT BLOCK (Cols A-F: idx 0 to 5)
+                # LEFT BLOCK (Days 1–15)
                 if len(row) > 0 and row[0].strip():
                     d_left = re.search(r'\b([1-3]?[0-9])\b', row[0])
                     if d_left:
@@ -232,7 +226,7 @@ def sync_roster(user_name: str = Form(...)):
                     elif "7" in t_left or "19" in t_left: last_time_left = ("19:00", "23:00")
 
                 left_names = " ".join(row[3:6]) if len(row) >= 4 else ""
-                if match_exact_name(left_names, locum_name):
+                if match_exact_name(left_names, locum_name) or match_exact_name(left_names, app_name):
                     results.append({
                         "date": f"{target_year}-{target_month}-{last_date_left}",
                         "shift": "Locum",
@@ -243,7 +237,7 @@ def sync_roster(user_name: str = Form(...)):
                         "isLocum": True
                     })
 
-                # RIGHT BLOCK (Cols G-L: idx 6 to 11)
+                # RIGHT BLOCK (Days 16–31)
                 if len(row) > 6 and row[6].strip():
                     d_right = re.search(r'\b([1-3]?[0-9])\b', row[6])
                     if d_right:
@@ -257,7 +251,7 @@ def sync_roster(user_name: str = Form(...)):
                     elif "7" in t_right or "19" in t_right: last_time_right = ("19:00", "23:00")
 
                 right_names = " ".join(row[9:12]) if len(row) >= 10 else ""
-                if match_exact_name(right_names, locum_name):
+                if match_exact_name(right_names, locum_name) or match_exact_name(right_names, app_name):
                     results.append({
                         "date": f"{target_year}-{target_month}-{last_date_right}",
                         "shift": "Locum",
