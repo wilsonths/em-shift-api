@@ -17,6 +17,7 @@ app.add_middleware(
 KNOWN_ZONES_SORTED = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS', 'Y']
 DAYS_OF_WEEK = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY']
 WORKING_SHIFTS = ['AM', 'PM', 'N']
+NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE']
 
 def match_exact_name(source_text: str, target_name: str) -> bool:
     if not source_text or not target_name:
@@ -54,27 +55,23 @@ async def parse_roster(
     with pdfplumber.open(io.BytesIO(contents)) as pdf:
         if roster_type == "weekly_hospital":
             for page in pdf.pages:
-                words = page.extract_words()
+                # x_tolerance=3 merges adjacent split tokens like 'Y' + '2' -> 'Y2'
+                words = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
                 if not words:
                     continue
 
-                # 1. Identify Shift Column X-Boundaries (Left to Right)
+                # 1. Locate Shift Column Header X-Ranges (AM, PM, N, SD, etc.)
                 shift_cols = []
                 for w in words:
                     txt = w['text'].upper().strip()
                     if txt in ['AM', 'PM', 'SD', 'OD', 'AL', 'MC']:
-                        shift_cols.append({'shift': txt, 'x0': w['x0'] - 10, 'x1': w['x1'] + 45})
+                        shift_cols.append({'shift': txt, 'x0': w['x0'] - 15, 'x1': w['x1'] + 15})
                     elif txt in ['NIGHT', 'N'] and len(txt) <= 5:
-                        shift_cols.append({'shift': 'N', 'x0': w['x0'] - 10, 'x1': w['x1'] + 45})
+                        shift_cols.append({'shift': 'N', 'x0': w['x0'] - 15, 'x1': w['x1'] + 15})
                 
-                # Remove duplicate column detections and sort left-to-right
                 shift_cols.sort(key=lambda c: c['x0'])
-                unique_cols = []
-                for c in shift_cols:
-                    if not any(abs(c['x0'] - uc['x0']) < 25 for uc in unique_cols):
-                        unique_cols.append(c)
 
-                # 2. Identify Day Row Y-Boundaries (Top to Bottom)
+                # 2. Locate Day Row Y-Ranges
                 day_rows = []
                 for w in words:
                     txt = w['text'].upper().strip()
@@ -84,16 +81,17 @@ async def parse_roster(
                             break
                 
                 day_rows.sort(key=lambda r: r['y0'])
+                
                 for idx, r in enumerate(day_rows):
-                    r['bottom'] = day_rows[idx + 1]['top'] if idx + 1 < len(day_rows) else page.height
+                    next_top = day_rows[idx + 1]['top'] if idx + 1 < len(day_rows) else page.height
+                    r['bottom'] = next_top
 
                 ref_dates = ['2026-10-05', '2026-10-06', '2026-10-07', '2026-10-08', '2026-10-09', '2026-10-10', '2026-10-11']
 
-                # 3. Process Row-by-Row, Left-to-Right
+                # 3. Match exact user name within bounding boxes
                 for idx, day_row in enumerate(day_rows):
                     target_date = ref_dates[idx] if idx < len(ref_dates) else f"2026-10-{(5+idx):02d}"
                     
-                    # Get words strictly inside this Date row (excluding bottom remarks)
                     row_words = [
                         w for w in words 
                         if day_row['top'] <= w['top'] < day_row['bottom'] 
@@ -102,71 +100,62 @@ async def parse_roster(
                     ]
                     
                     row_full_text = " ".join([w['text'] for w in row_words])
-                    if not match_exact_name(row_full_text, target_name):
-                        continue
-
-                    # Search Column by Column from Left to Right
-                    shift_found = None
-                    detected_zone = ""
-
-                    for col in unique_cols:
-                        col_words = [
+                    
+                    if match_exact_name(row_full_text, target_name):
+                        # Calculate center coordinates of user's name
+                        name_words = [
                             w for w in row_words 
-                            if col['x0'] <= w['x0'] <= col['x1'] + 60
+                            if any(t == re.sub(r'[^A-Z0-9]', '', w['text'].upper()) for t in target_tokens)
                         ]
-                        col_text = " ".join([w['text'] for w in col_words])
 
-                        if match_exact_name(col_text, target_name):
-                            shift_found = col['shift']
+                        if name_words:
+                            name_x = sum((w['x0'] + w['x1']) / 2.0 for w in name_words) / len(name_words)
+                            name_y = sum((w['top'] + w['bottom']) / 2.0 for w in name_words) / len(name_words)
+                        else:
+                            name_x = (row_words[0]['x0'] + row_words[0]['x1']) / 2.0
+                            name_y = (row_words[0]['top'] + row_words[0]['bottom']) / 2.0
 
-                            # If working shift (AM, PM, N): read zone immediately to the RIGHT of the name
-                            if shift_found in WORKING_SHIFTS:
-                                name_words = [
-                                    w for w in col_words 
-                                    if any(t == re.sub(r'[^A-Z0-9]', '', w['text'].upper()) for t in target_tokens)
-                                ]
-                                if name_words:
-                                    name_x1 = max(w['x1'] for w in name_words)
-                                    name_y = sum((w['top'] + w['bottom'])/2.0 for w in name_words) / len(name_words)
+                        # Determine shift type based on closest header column
+                        matched_shift = "AM"
+                        if shift_cols:
+                            best_col = min(shift_cols, key=lambda c: abs((c['x0'] + c['x1'])/2 - name_x))
+                            matched_shift = best_col['shift']
+                        else:
+                            if "PM" in row_full_text.upper(): matched_shift = "PM"
+                            elif "NIGHT" in row_full_text.upper() or " N " in row_full_text.upper(): matched_shift = "N"
+                            elif "SD" in row_full_text.upper(): matched_shift = "SD"
 
-                                    # Search words on the same row line (y +- 6) sitting to the right of the name
-                                    right_words = [
-                                        w for w in row_words
-                                        if abs(((w['top'] + w['bottom'])/2.0) - name_y) <= 8
-                                        and w['x0'] >= name_x1 - 5
-                                    ]
-                                    right_words.sort(key=lambda w: w['x0'])
+                        # Determine Zone: Strictly CLEAR for non-working shifts (SD, OD, AL, etc.)
+                        detected_zone = ""
+                        if matched_shift in WORKING_SHIFTS:
+                            zone_candidates = []
+                            for w in row_words:
+                                z = extract_zone_from_text(w['text'])
+                                if z and z != 'Y': # Ignore generic 'Y' in favor of specific zones like Y2, Y/TL
+                                    zone_candidates.append({
+                                        'zone': z,
+                                        'x': (w['x0'] + w['x1']) / 2.0,
+                                        'y': (w['top'] + w['bottom']) / 2.0
+                                    })
 
-                                    # Check single word or adjacent combined word (e.g. "Y" + "2" -> "Y2")
-                                    for rw_idx in range(len(right_words)):
-                                        w1_text = right_words[rw_idx]['text']
-                                        z = extract_zone_from_text(w1_text)
-                                        if z:
-                                            detected_zone = z
-                                            break
-                                        if rw_idx + 1 < len(right_words):
-                                            combo = w1_text + right_words[rw_idx + 1]['text']
-                                            z_combo = extract_zone_from_text(combo)
-                                            if z_combo:
-                                                detected_zone = z_combo
-                                                break
-                            else:
-                                # SD, OD, AL, MC -> Strictly NO Zone
-                                detected_zone = ""
+                            if zone_candidates:
+                                # Pick zone physically closest to doctor's name center
+                                best_candidate = min(
+                                    zone_candidates,
+                                    key=lambda c: (abs(c['x'] - name_x) + 2 * abs(c['y'] - name_y))
+                                )
+                                detected_zone = best_candidate['zone']
 
-                            break # Found name in this date row; stop scanning columns and move to next date row
-
-                    if shift_found:
                         start_time, end_time = "08:00", "16:00"
-                        if shift_found == 'PM': start_time, end_time = "14:00", "22:00"
-                        elif shift_found == 'N': start_time, end_time = "21:00", "09:00"
-                        elif shift_found not in WORKING_SHIFTS: start_time, end_time = "", ""
+                        if matched_shift == 'PM': start_time, end_time = "14:00", "22:00"
+                        elif matched_shift == 'N': start_time, end_time = "21:00", "09:00"
+                        elif matched_shift in NO_ZONE_SHIFTS: start_time, end_time = "", ""
 
                         extracted_results.append({
                             "date": target_date,
-                            "shift": shift_found,
+                            "shift": matched_shift,
                             "zone": detected_zone,
-                            "assignmentType": shift_found,
+                            "assignmentType": matched_shift,
                             "startTime": start_time,
                             "endTime": end_time,
                             "isLocum": False
@@ -174,7 +163,7 @@ async def parse_roster(
 
         elif roster_type == "monthly_locum":
             for page in pdf.pages:
-                words = page.extract_words()
+                words = page.extract_words(x_tolerance=3, y_tolerance=3)
                 if not words: continue
 
                 w_mid = page.width / 2
