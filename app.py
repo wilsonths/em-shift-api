@@ -142,7 +142,7 @@ async def parse_roster(
                                 
                                 if i + 1 < len(sorted_row_words):
                                     w2 = sorted_row_words[i + 1]
-                                    if abs(w1['top'] - w2['top']) < 6 and abs(w1['x1'] - w2['x0']) < 10:
+                                    if abs(w1['top'] - w2['top']) < 6 and abs(w1['x1'] - w2['x0']) < 12:
                                         combo_text = w1['text'] + w2['text']
                                         z_combo = extract_zone_from_text(combo_text)
                                         if z_combo:
@@ -153,12 +153,20 @@ async def parse_roster(
                                             })
 
                             if zone_candidates:
-                                # Pick zone physically closest to doctor's name center
-                                best_candidate = min(
-                                    zone_candidates,
-                                    key=lambda c: ((c['x'] - name_x)**2 + 3 * (c['y'] - name_y)**2)
-                                )
-                                detected_zone = best_candidate['zone']
+                                # STEP 1: Same-line priority check (Y difference <= 6px)
+                                same_line_candidates = [
+                                    c for c in zone_candidates if abs(c['y'] - name_y) <= 6
+                                ]
+                                if same_line_candidates:
+                                    best_candidate = min(same_line_candidates, key=lambda c: abs(c['x'] - name_x))
+                                    detected_zone = best_candidate['zone']
+                                else:
+                                    # STEP 2: Fallback to 2D proximity if zone is a header above/below
+                                    best_candidate = min(
+                                        zone_candidates,
+                                        key=lambda c: (abs(c['x'] - name_x) + 5 * abs(c['y'] - name_y))
+                                    )
+                                    detected_zone = best_candidate['zone']
 
                         start_time, end_time = "08:00", "16:00"
                         if matched_shift == 'PM': start_time, end_time = "14:00", "22:00"
