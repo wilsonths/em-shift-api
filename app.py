@@ -21,7 +21,7 @@ CSV_BASE_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=o
 
 KNOWN_ZONES = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS', 'Y']
 WORKING_SHIFTS = ['AM', 'PM', 'N', 'NIGHT']
-NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE']
+NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', 'OFF', 'REST', 'SL']
 
 # Column indices for the 7 horizontal day blocks (A, H, O, V, AC, AJ, AQ)
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
@@ -103,22 +103,19 @@ def sync_roster(user_name: str = Form(...)):
         weekly_sheet = fetch_sheet_csv("Weekly")
         if len(weekly_sheet) >= 10:
             
-            # --- BASE DATE EXTRACTION WITH SEQUENTIAL PROGRESSION ---
+            # --- BASE DATE EXTRACTION ---
             base_date_dt = None
-            
-            # Scan Row 10 (index 9) or Row 11 across all block columns to find first valid date
             for r_idx in [9, 10, 8]:
                 if r_idx < len(weekly_sheet):
                     row_data = weekly_sheet[r_idx]
                     for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
-                        for col_offset in [1, 0, 2]: # Check Col B, then A, then C
+                        for col_offset in [1, 0, 2]:
                             cell_idx = block_col + col_offset
                             if cell_idx < len(row_data):
                                 parsed = parse_date_string(row_data[cell_idx])
                                 if parsed:
                                     try:
                                         found_dt = datetime.strptime(parsed, "%Y-%m-%d")
-                                        # Calculate Monday's base date relative to this block
                                         base_date_dt = found_dt - timedelta(days=b_idx)
                                         break
                                     except ValueError:
@@ -127,12 +124,11 @@ def sync_roster(user_name: str = Form(...)):
                 if base_date_dt: break
 
             if not base_date_dt:
-                base_date_dt = datetime(2026, 10, 5) # Default fallback if no date found
+                base_date_dt = datetime(2026, 10, 5)
 
-            # Generate exact sequential dates for all 7 day blocks
             block_dates = [(base_date_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
 
-            # --- PROCESS SHIFTS FOR EACH DAY BLOCK ---
+            # --- PROCESS EACH DAY BLOCK INDEPENDENTLY ---
             for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
                 assigned_date = block_dates[b_idx]
                 current_shift = "AM"
@@ -142,25 +138,35 @@ def sync_roster(user_name: str = Form(...)):
                     row = weekly_sheet[r_idx]
                     if not row: continue
 
-                    # Check shift label in column A/H/O...
-                    shift_cell = row[block_col].upper().strip() if block_col < len(row) else ""
-                    if shift_cell:
-                        if "AM" in shift_cell: current_shift = "AM"
-                        elif "PM" in shift_cell: current_shift = "PM"
-                        elif "NIGHT" in shift_cell or shift_cell == "N": current_shift = "N"
-                        elif "SD" in shift_cell: current_shift = "SD"
-                        elif "OD" in shift_cell: current_shift = "OD"
-                        elif "AL" in shift_cell: current_shift = "AL"
-                        elif "OL" in shift_cell: current_shift = "OL"
+                    # Update shift tracking if a shift header is present in the block's main column
+                    if block_col < len(row):
+                        shift_cell = row[block_col].upper().strip()
+                        if shift_cell:
+                            if "AM" in shift_cell: current_shift = "AM"
+                            elif "PM" in shift_cell: current_shift = "PM"
+                            elif "NIGHT" in shift_cell or shift_cell == "N": current_shift = "N"
+                            elif "SD" in shift_cell or "S/D" in shift_cell: current_shift = "SD"
+                            elif "OD" in shift_cell or "O/D" in shift_cell: current_shift = "OD"
+                            elif "AL" in shift_cell: current_shift = "AL"
+                            elif "OL" in shift_cell: current_shift = "OL"
+                            elif "MC" in shift_cell: current_shift = "MC"
+                            elif "OFF" in shift_cell or "REST" in shift_cell: current_shift = "OFF"
+                            elif "LEAVE" in shift_cell: current_shift = "LEAVE"
 
-                    # Check name in column B/I/P...
-                    name_cell = row[block_col + 1] if block_col + 1 < len(row) else ""
-                    if match_exact_name(name_cell, weekly_name):
-                        zone_cell = row[block_col + 2] if block_col + 2 < len(row) else ""
+                    # Scan all sub-columns inside this day block (block_col to block_col + 6)
+                    block_cells = row[block_col : min(block_col + 7, len(row))]
+                    block_text = " ".join(block_cells)
+
+                    if match_exact_name(block_text, weekly_name):
                         detected_zone = ""
-                        
                         if current_shift in WORKING_SHIFTS:
-                            detected_zone = extract_zone(zone_cell) or extract_zone(name_cell)
+                            for cell in block_cells:
+                                z = extract_zone(cell)
+                                if z and not match_exact_name(cell, weekly_name):
+                                    detected_zone = z
+                                    break
+                            if not detected_zone:
+                                detected_zone = extract_zone(block_text)
 
                         s_time, e_time = "08:00", "16:00"
                         if current_shift == 'PM': s_time, e_time = "14:00", "22:00"
@@ -176,6 +182,8 @@ def sync_roster(user_name: str = Form(...)):
                             "endTime": e_time,
                             "isLocum": False
                         })
+                        break # Done with this day block
+
     except Exception as e:
         print(f"Weekly Sheet Error: {e}")
 
