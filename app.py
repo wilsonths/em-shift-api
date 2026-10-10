@@ -22,23 +22,32 @@ KNOWN_ZONES = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS',
 WORKING_SHIFTS = ['AM', 'PM', 'N', 'NIGHT']
 NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', 'OFF', 'REST', 'SL']
 
+# Column indices for Mon(A=0), Tue(H=7), Wed(O=14), Thu(V=21), Fri(AC=28), Sat(AJ=35), Sun(AQ=42)
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
-    # GViz Query API strictly respects tab names (&sheet=Weekly, &sheet=Locum, &sheet=Aliases)
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}"
     response = requests.get(url, timeout=10)
     response.encoding = 'utf-8'
     if response.status_code == 200:
-        return list(csv.reader(io.StringIO(response.text)))
+        rows = list(csv.reader(io.StringIO(response.text)))
+        padded_rows = []
+        for r in rows:
+            # Replace non-breaking spaces (\xa0) and pad short rows to 50 columns
+            clean_r = [cell.replace('\xa0', ' ').strip() for cell in r]
+            if len(clean_r) < 50:
+                clean_r += [""] * (50 - len(clean_r))
+            padded_rows.append(clean_r)
+        return padded_rows
     return []
 
 def match_exact_name(cell_text: str, target_name: str) -> bool:
     if not cell_text or not target_name:
         return False
-    clean_target = re.escape(target_name.upper().strip())
-    pattern = r'(?:^|\s|[^A-Z0-9])' + clean_target + r'(?:$|\s|[^A-Z0-9])'
-    return bool(re.search(pattern, cell_text.upper()))
+    cleaned_cell = re.sub(r'[^A-Z0-9\s]', ' ', cell_text.upper())
+    clean_target = re.sub(r'[^A-Z0-9\s]', ' ', target_name.upper()).strip()
+    pattern = r'(?:^|\s)' + re.escape(clean_target) + r'(?:\s|$)'
+    return bool(re.search(pattern, cleaned_cell))
 
 def extract_zone(text: str) -> str:
     cleaned = re.sub(r'[^A-Z0-9/]', '', text.upper().strip())
@@ -134,37 +143,33 @@ def sync_roster(user_name: str = Form(...)):
                 assigned_date = block_dates[b_idx]
                 current_shift = "AM"
 
+                # Row 12 (0-indexed = 11) onwards strictly for shift labels & names
                 for r_idx in range(11, len(weekly_sheet)):
                     row = weekly_sheet[r_idx]
-                    if not row: continue
 
-                    if block_col < len(row):
-                        shift_cell = row[block_col].upper().strip()
-                        if shift_cell:
-                            if "AM" in shift_cell: current_shift = "AM"
-                            elif "PM" in shift_cell: current_shift = "PM"
-                            elif "NIGHT" in shift_cell or shift_cell == "N": current_shift = "N"
-                            elif "SD" in shift_cell or "S/D" in shift_cell: current_shift = "SD"
-                            elif "OD" in shift_cell or "O/D" in shift_cell: current_shift = "OD"
-                            elif "AL" in shift_cell: current_shift = "AL"
-                            elif "OL" in shift_cell: current_shift = "OL"
-                            elif "MC" in shift_cell: current_shift = "MC"
-                            elif "OFF" in shift_cell or "REST" in shift_cell: current_shift = "OFF"
-                            elif "LEAVE" in shift_cell: current_shift = "LEAVE"
+                    # Shift label is strictly in block_col (Col A, H, O, V, AC, AJ, AQ)
+                    shift_cell = row[block_col].upper().strip()
+                    if shift_cell:
+                        if "AM" in shift_cell: current_shift = "AM"
+                        elif "PM" in shift_cell: current_shift = "PM"
+                        elif "NIGHT" in shift_cell or shift_cell == "N": current_shift = "N"
+                        elif "SD" in shift_cell or "S/D" in shift_cell: current_shift = "SD"
+                        elif "OD" in shift_cell or "O/D" in shift_cell: current_shift = "OD"
+                        elif "AL" in shift_cell: current_shift = "AL"
+                        elif "OL" in shift_cell: current_shift = "OL"
+                        elif "MC" in shift_cell: current_shift = "MC"
+                        elif "OFF" in shift_cell or "REST" in shift_cell: current_shift = "OFF"
+                        elif "LEAVE" in shift_cell: current_shift = "LEAVE"
 
-                    block_cells = row[block_col : min(block_col + 7, len(row))]
-                    block_text = " ".join(block_cells)
-
-                    if match_exact_name(block_text, weekly_name):
+                    # Name is strictly in block_col + 1 (Col B, I, P, W, AD, AK, AR)
+                    name_cell = row[block_col + 1]
+                    
+                    if match_exact_name(name_cell, weekly_name):
+                        # Zone is strictly in block_col + 2 (Col C, J, Q, X, AE, AL, AS)
+                        zone_cell = row[block_col + 2]
                         detected_zone = ""
                         if current_shift in WORKING_SHIFTS:
-                            for cell in block_cells:
-                                z = extract_zone(cell)
-                                if z and not match_exact_name(cell, weekly_name):
-                                    detected_zone = z
-                                    break
-                            if not detected_zone:
-                                detected_zone = extract_zone(block_text)
+                            detected_zone = extract_zone(zone_cell) or extract_zone(name_cell)
 
                         s_time, e_time = "08:00", "16:00"
                         if current_shift == 'PM': s_time, e_time = "14:00", "22:00"
@@ -210,22 +215,20 @@ def sync_roster(user_name: str = Form(...)):
             last_time_right = ("19:00", "23:00")
 
             for row in locum_sheet[1:]:
-                if not row: continue
-
                 # LEFT BLOCK (Days 1–15)
-                if len(row) > 0 and row[0].strip():
+                if row[0].strip():
                     d_left = re.search(r'\b([1-3]?[0-9])\b', row[0])
                     if d_left:
                         val = int(d_left.group(1))
                         if 1 <= val <= 31: last_date_left = str(val).zfill(2)
 
-                if len(row) > 2 and row[2].strip():
+                if row[2].strip():
                     t_left = row[2].upper()
                     if "10" in t_left: last_time_left = ("10:00", "14:00")
                     elif "2" in t_left: last_time_left = ("14:00", "18:00")
                     elif "7" in t_left or "19" in t_left: last_time_left = ("19:00", "23:00")
 
-                left_names = " ".join(row[3:6]) if len(row) >= 4 else ""
+                left_names = " ".join(row[3:6])
                 if match_exact_name(left_names, locum_name) or match_exact_name(left_names, app_name):
                     results.append({
                         "date": f"{target_year}-{target_month}-{last_date_left}",
@@ -238,19 +241,19 @@ def sync_roster(user_name: str = Form(...)):
                     })
 
                 # RIGHT BLOCK (Days 16–31)
-                if len(row) > 6 and row[6].strip():
+                if row[6].strip():
                     d_right = re.search(r'\b([1-3]?[0-9])\b', row[6])
                     if d_right:
                         val_r = int(d_right.group(1))
                         if 1 <= val_r <= 31: last_date_right = str(val_r).zfill(2)
 
-                if len(row) > 8 and row[8].strip():
+                if row[8].strip():
                     t_right = row[8].upper()
                     if "10" in t_right: last_time_right = ("10:00", "14:00")
                     elif "2" in t_right: last_time_right = ("14:00", "18:00")
                     elif "7" in t_right or "19" in t_right: last_time_right = ("19:00", "23:00")
 
-                right_names = " ".join(row[9:12]) if len(row) >= 10 else ""
+                right_names = " ".join(row[9:12])
                 if match_exact_name(right_names, locum_name) or match_exact_name(right_names, app_name):
                     results.append({
                         "date": f"{target_year}-{target_month}-{last_date_right}",
