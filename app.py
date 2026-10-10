@@ -4,7 +4,7 @@ import requests
 import csv
 import io
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = FastAPI(title="EM Shift Master Hub API")
 
@@ -47,13 +47,32 @@ def extract_zone(text: str) -> str:
     return ""
 
 def parse_date_string(text: str) -> str:
-    m = re.search(r'\b([0-3]?[0-9])[/.-]([0-1]?[0-9])(?:[/.-](20\d\d|\d\d))?\b', text)
+    if not text: return ""
+    text = text.strip()
+    
+    # Format 1: YYYY-MM-DD
+    m = re.search(r'\b(20\d\d)[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12][0-9]|3[01])\b', text)
+    if m:
+        return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
+
+    # Format 2: DD/MM/YYYY or DD/MM/YY or DD/MM
+    m = re.search(r'\b(0?[1-9]|[12][0-9]|3[01])[/.-](0?[1-9]|1[0-2])(?:[/.-](20\d\d|\d\d))?\b', text)
     if m:
         day = m.group(1).zfill(2)
         month = m.group(2).zfill(2)
-        year = m.group(3) if m.group(3) else "2026"
-        if len(year) == 2: year = "20" + year
+        raw_year = m.group(3)
+        year = raw_year if (raw_year and len(raw_year) == 4) else ("20" + raw_year if raw_year else "2026")
         return f"{year}-{month}-{day}"
+
+    # Format 3: DD Mon (e.g., 12 Oct or 12-Oct)
+    m = re.search(r'\b(0?[1-9]|[12][0-9]|3[01])[\s\-_](JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*\b', text, re.IGNORECASE)
+    if m:
+        day = m.group(1).zfill(2)
+        m_str = m.group(2).upper()
+        months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
+        month = str(months.index(m_str) + 1).zfill(2)
+        return f"2026-{month}-{day}"
+
     return ""
 
 @app.get("/")
@@ -83,16 +102,39 @@ def sync_roster(user_name: str = Form(...)):
     try:
         weekly_sheet = fetch_sheet_csv("Weekly")
         if len(weekly_sheet) >= 10:
-            row_10 = weekly_sheet[9] # Row 10 (0-indexed = 9)
+            
+            # --- BASE DATE EXTRACTION WITH SEQUENTIAL PROGRESSION ---
+            base_date_dt = None
+            
+            # Scan Row 10 (index 9) or Row 11 across all block columns to find first valid date
+            for r_idx in [9, 10, 8]:
+                if r_idx < len(weekly_sheet):
+                    row_data = weekly_sheet[r_idx]
+                    for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
+                        for col_offset in [1, 0, 2]: # Check Col B, then A, then C
+                            cell_idx = block_col + col_offset
+                            if cell_idx < len(row_data):
+                                parsed = parse_date_string(row_data[cell_idx])
+                                if parsed:
+                                    try:
+                                        found_dt = datetime.strptime(parsed, "%Y-%m-%d")
+                                        # Calculate Monday's base date relative to this block
+                                        base_date_dt = found_dt - timedelta(days=b_idx)
+                                        break
+                                    except ValueError:
+                                        pass
+                        if base_date_dt: break
+                if base_date_dt: break
 
-            # Process each of the 7 day column blocks
-            for block_col in DAY_BLOCK_COLS:
-                # Extract date from Column B, I, P, W, AD, AK, AR on Row 10
-                date_cell = row_10[block_col + 1] if block_col + 1 < len(row_10) else ""
-                extracted_date = parse_date_string(date_cell)
-                if not extracted_date:
-                    extracted_date = "2026-10-05"
+            if not base_date_dt:
+                base_date_dt = datetime(2026, 10, 5) # Default fallback if no date found
 
+            # Generate exact sequential dates for all 7 day blocks
+            block_dates = [(base_date_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
+            # --- PROCESS SHIFTS FOR EACH DAY BLOCK ---
+            for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
+                assigned_date = block_dates[b_idx]
                 current_shift = "AM"
 
                 # Scan from Row 12 downwards (index 11)
@@ -126,7 +168,7 @@ def sync_roster(user_name: str = Form(...)):
                         elif current_shift in NO_ZONE_SHIFTS: s_time, e_time = "", ""
 
                         results.append({
-                            "date": extracted_date,
+                            "date": assigned_date,
                             "shift": current_shift,
                             "zone": detected_zone,
                             "assignmentType": current_shift,
@@ -141,7 +183,6 @@ def sync_roster(user_name: str = Form(...)):
     try:
         locum_sheet = fetch_sheet_csv("Locum")
         if len(locum_sheet) > 1:
-            # Detect Month & Year from Row 1
             header_text = " ".join(locum_sheet[0]).upper()
             target_month = "10"
             target_year = "2026"
@@ -159,14 +200,13 @@ def sync_roster(user_name: str = Form(...)):
 
             last_date_left = "01"
             last_time_left = ("19:00", "23:00")
-            
             last_date_right = "16"
             last_time_right = ("19:00", "23:00")
 
             for row in locum_sheet[1:]:
                 if not row: continue
 
-                # --- LEFT BLOCK (Cols A-E) ---
+                # LEFT BLOCK (Cols A-E)
                 d_left = re.search(r'\b([1-3]?[0-9])\b', row[0]) if len(row) > 0 else None
                 if d_left: last_date_left = d_left.group(1).zfill(2)
 
@@ -187,7 +227,7 @@ def sync_roster(user_name: str = Form(...)):
                         "isLocum": True
                     })
 
-                # --- RIGHT BLOCK (Cols G-K) ---
+                # RIGHT BLOCK (Cols G-K)
                 d_right = re.search(r'\b([1-3]?[0-9])\b', row[6]) if len(row) > 6 else None
                 if d_right: last_date_right = d_right.group(1).zfill(2)
 
