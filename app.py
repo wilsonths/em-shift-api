@@ -14,9 +14,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-KNOWN_ZONES = ['R1', 'R2A', 'R2B', 'Y/TL', 'YS', 'Y/C', 'Y', 'Y2', 'GZ', 'GS', 'REG']
+KNOWN_ZONES_SORTED = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS', 'Y']
 DAYS_OF_WEEK = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY']
-NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE']
+WORKING_SHIFTS = ['AM', 'PM', 'N']
 
 def match_exact_name(source_text: str, target_name: str) -> bool:
     if not source_text or not target_name:
@@ -24,6 +24,14 @@ def match_exact_name(source_text: str, target_name: str) -> bool:
     clean_target = re.escape(target_name.upper().strip())
     pattern = r'(?:^|\s|[^A-Z0-9])' + clean_target + r'(?:$|\s|[^A-Z0-9])'
     return bool(re.search(pattern, source_text.upper()))
+
+def extract_zone_from_word(text: str) -> str:
+    text_upper = text.upper().strip()
+    for zone in KNOWN_ZONES_SORTED:
+        pattern = r'(?:^|[\s/:\-_(])' + re.escape(zone) + r'(?:$|[\s/:\-_)])'
+        if re.search(pattern, text_upper):
+            return zone
+    return ""
 
 @app.get("/")
 def health_check():
@@ -40,6 +48,7 @@ async def parse_roster(
 
     contents = await file.read()
     target_name = user_name.upper().strip()
+    target_tokens = [t for t in re.split(r'\s+', target_name) if len(t) > 1]
     extracted_results = []
 
     with pdfplumber.open(io.BytesIO(contents)) as pdf:
@@ -91,8 +100,18 @@ async def parse_roster(
                     row_full_text = " ".join([w['text'] for w in row_words])
                     
                     if match_exact_name(row_full_text, target_name):
-                        name_words = [w for w in row_words if match_exact_name(w['text'], target_name)]
-                        name_x = name_words[0]['x0'] if name_words else row_words[0]['x0']
+                        # Locate exact word tokens belonging to doctor's name
+                        name_words = [
+                            w for w in row_words 
+                            if any(t == re.sub(r'[^A-Z0-9]', '', w['text'].upper()) for t in target_tokens)
+                        ]
+
+                        if name_words:
+                            name_x = sum((w['x0'] + w['x1']) / 2.0 for w in name_words) / len(name_words)
+                            name_y = sum((w['top'] + w['bottom']) / 2.0 for w in name_words) / len(name_words)
+                        else:
+                            name_x = (row_words[0]['x0'] + row_words[0]['x1']) / 2.0
+                            name_y = (row_words[0]['top'] + row_words[0]['bottom']) / 2.0
 
                         # Determine shift type based on closest header column
                         matched_shift = "AM"
@@ -104,25 +123,31 @@ async def parse_roster(
                             elif "NIGHT" in row_full_text.upper() or " N " in row_full_text.upper(): matched_shift = "N"
                             elif "SD" in row_full_text.upper(): matched_shift = "SD"
 
-                        # Determine Zone: STRICTLY CLEAR for non-working shifts
+                        # Determine Zone: STRICTLY CLEAR for non-working shifts (SD, OD, AL, etc.)
                         detected_zone = ""
-                        if matched_shift not in NO_ZONE_SHIFTS:
-                            # Search for zone labels ONLY within close horizontal proximity to user's name
-                            nearby_words = [
-                                w['text'].upper() for w in row_words 
-                                if abs(w['x0'] - name_x) < 45
-                            ]
-                            nearby_text = " ".join(nearby_words)
+                        if matched_shift in WORKING_SHIFTS:
+                            zone_candidates = []
+                            for w in row_words:
+                                z_match = extract_zone_from_word(w['text'])
+                                if z_match:
+                                    zone_candidates.append({
+                                        'zone': z_match,
+                                        'x': (w['x0'] + w['x1']) / 2.0,
+                                        'y': (w['top'] + w['bottom']) / 2.0
+                                    })
                             
-                            for z in KNOWN_ZONES:
-                                if z in nearby_text:
-                                    detected_zone = z;
-                                    break
+                            if zone_candidates:
+                                # 2D Spatial Proximity: Pick zone physically closest to doctor's name center
+                                best_candidate = min(
+                                    zone_candidates,
+                                    key=lambda c: ((c['x'] - name_x)**2 + 3 * (c['y'] - name_y)**2)
+                                )
+                                detected_zone = best_candidate['zone']
 
                         start_time, end_time = "08:00", "16:00"
                         if matched_shift == 'PM': start_time, end_time = "14:00", "22:00"
                         elif matched_shift == 'N': start_time, end_time = "21:00", "09:00"
-                        elif matched_shift in NO_ZONE_SHIFTS: start_time, end_time = "", ""
+                        elif matched_shift not in WORKING_SHIFTS: start_time, end_time = "", ""
 
                         extracted_results.append({
                             "date": target_date,
