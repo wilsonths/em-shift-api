@@ -25,12 +25,11 @@ def match_exact_name(source_text: str, target_name: str) -> bool:
     pattern = r'(?:^|\s|[^A-Z0-9])' + clean_target + r'(?:$|\s|[^A-Z0-9])'
     return bool(re.search(pattern, source_text.upper()))
 
-def extract_zone_from_str(text: str) -> str:
-    # Remove interior spaces (e.g. "Y 2" -> "Y2", "R 2A" -> "R2A")
-    cleaned = re.sub(r'\s+', '', text.upper())
+def extract_zone_from_text(text: str) -> str:
+    text_clean = re.sub(r'[^A-Z0-9/]', '', text.upper().strip())
     for zone in KNOWN_ZONES_SORTED:
         pattern = r'(?:^|[^A-Z0-9])' + re.escape(zone) + r'(?:$|[^A-Z0-9])'
-        if re.search(pattern, cleaned):
+        if re.search(pattern, text_clean):
             return zone
     return ""
 
@@ -101,7 +100,7 @@ async def parse_roster(
                     row_full_text = " ".join([w['text'] for w in row_words])
                     
                     if match_exact_name(row_full_text, target_name):
-                        # Calculate exact X center of doctor's name
+                        # Locate exact word tokens belonging to doctor's name
                         name_words = [
                             w for w in row_words 
                             if any(t == re.sub(r'[^A-Z0-9]', '', w['text'].upper()) for t in target_tokens)
@@ -109,8 +108,10 @@ async def parse_roster(
 
                         if name_words:
                             name_x = sum((w['x0'] + w['x1']) / 2.0 for w in name_words) / len(name_words)
+                            name_y = sum((w['top'] + w['bottom']) / 2.0 for w in name_words) / len(name_words)
                         else:
                             name_x = (row_words[0]['x0'] + row_words[0]['x1']) / 2.0
+                            name_y = (row_words[0]['top'] + row_words[0]['bottom']) / 2.0
 
                         # Determine shift type based on closest header column
                         matched_shift = "AM"
@@ -122,45 +123,41 @@ async def parse_roster(
                             elif "NIGHT" in row_full_text.upper() or " N " in row_full_text.upper(): matched_shift = "N"
                             elif "SD" in row_full_text.upper(): matched_shift = "SD"
 
-                        # Determine Zone: STRICTLY CLEAR for non-working shifts
+                        # Determine Zone: STRICTLY CLEAR for non-working shifts (SD, OD, AL, etc.)
                         detected_zone = ""
                         if matched_shift in WORKING_SHIFTS:
-                            # Reconstruct line fragments to fix split characters ("Y" + "2" -> "Y2")
-                            line_clusters = []
+                            zone_candidates = []
                             sorted_row_words = sorted(row_words, key=lambda w: (w['top'], w['x0']))
                             
-                            for w in sorted_row_words:
-                                inserted = False
-                                for lc in line_clusters:
-                                    if abs(lc['top'] - w['top']) < 6 and abs(lc['x1'] - w['x0']) < 18:
-                                        lc['text'] += " " + w['text']
-                                        lc['x1'] = w['x1']
-                                        lc['words'].append(w)
-                                        inserted = True
-                                        break
-                                if not inserted:
-                                    line_clusters.append({
-                                        'text': w['text'],
-                                        'top': w['top'],
-                                        'x0': w['x0'],
-                                        'x1': w['x1'],
-                                        'words': [w]
-                                    })
-
-                            zone_candidates = []
-                            for lc in line_clusters:
-                                z_match = extract_zone_from_str(lc['text'])
-                                if z_match:
-                                    lc_x = (lc['x0'] + lc['x1']) / 2.0
+                            # Check single words and adjacent word pairs (to fix split tokens like "Y" + "2" -> "Y2")
+                            for i in range(len(sorted_row_words)):
+                                w1 = sorted_row_words[i]
+                                z1 = extract_zone_from_text(w1['text'])
+                                if z1 and z1 != 'Y': # Prefer specific zones over single 'Y'
                                     zone_candidates.append({
-                                        'zone': z_match,
-                                        'x': lc_x,
-                                        'dist_x': abs(lc_x - name_x)
+                                        'zone': z1,
+                                        'x': (w1['x0'] + w1['x1']) / 2.0,
+                                        'y': (w1['top'] + w1['bottom']) / 2.0
                                     })
+                                
+                                if i + 1 < len(sorted_row_words):
+                                    w2 = sorted_row_words[i + 1]
+                                    if abs(w1['top'] - w2['top']) < 6 and abs(w1['x1'] - w2['x0']) < 10:
+                                        combo_text = w1['text'] + w2['text']
+                                        z_combo = extract_zone_from_text(combo_text)
+                                        if z_combo:
+                                            zone_candidates.append({
+                                                'zone': z_combo,
+                                                'x': (w1['x0'] + w2['x1']) / 2.0,
+                                                'y': (w1['top'] + w2['bottom']) / 2.0
+                                            })
 
                             if zone_candidates:
-                                # Pick zone column header with smallest horizontal distance to name
-                                best_candidate = min(zone_candidates, key=lambda c: c['dist_x'])
+                                # Pick zone physically closest to doctor's name center
+                                best_candidate = min(
+                                    zone_candidates,
+                                    key=lambda c: ((c['x'] - name_x)**2 + 3 * (c['y'] - name_y)**2)
+                                )
                                 detected_zone = best_candidate['zone']
 
                         start_time, end_time = "08:00", "16:00"
