@@ -22,7 +22,6 @@ KNOWN_ZONES = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS',
 WORKING_SHIFTS = ['AM', 'PM', 'N', 'NIGHT']
 NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', 'OFF', 'REST', 'SL']
 
-# Column indices for Mon(A=0), Tue(H=7), Wed(O=14), Thu(V=21), Fri(AC=28), Sat(AJ=35), Sun(AQ=42)
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
@@ -33,7 +32,6 @@ def fetch_sheet_csv(tab_name: str):
         rows = list(csv.reader(io.StringIO(response.text)))
         padded_rows = []
         for r in rows:
-            # Replace non-breaking spaces (\xa0) and pad short rows to 50 columns
             clean_r = [cell.replace('\xa0', ' ').strip() for cell in r]
             if len(clean_r) < 50:
                 clean_r += [""] * (50 - len(clean_r))
@@ -41,19 +39,35 @@ def fetch_sheet_csv(tab_name: str):
         return padded_rows
     return []
 
-def match_exact_name(cell_text: str, target_name: str) -> bool:
-    if not cell_text or not target_name:
+def match_flexible_name(cell_text: str, app_name: str, weekly_name: str) -> bool:
+    if not cell_text:
         return False
     cleaned_cell = re.sub(r'[^A-Z0-9\s]', ' ', cell_text.upper())
-    clean_target = re.sub(r'[^A-Z0-9\s]', ' ', target_name.upper()).strip()
-    pattern = r'(?:^|\s)' + re.escape(clean_target) + r'(?:\s|$)'
-    return bool(re.search(pattern, cleaned_cell))
+    
+    candidates = set()
+    for n in [app_name, weekly_name]:
+        if not n: continue
+        n_clean = n.upper().strip()
+        candidates.add(n_clean)
+        words = n_clean.split()
+        for w in words:
+            if len(w) >= 3:
+                candidates.add(w)
+                
+    for candidate in candidates:
+        pattern = r'(?:^|\s)' + re.escape(candidate) + r'(?:\s|$)'
+        if re.search(pattern, cleaned_cell):
+            return True
+            
+    return False
 
 def extract_zone(text: str) -> str:
-    cleaned = re.sub(r'[^A-Z0-9/]', '', text.upper().strip())
+    if not text: return ""
+    text_upper = text.upper().strip()
+    cleaned_spaces = re.sub(r'[^A-Z0-9/]', ' ', text_upper)
     for z in KNOWN_ZONES:
-        pattern = r'(?:^|[^A-Z0-9])' + re.escape(z) + r'(?:$|[^A-Z0-9])'
-        if re.search(pattern, cleaned):
+        pattern = r'(?:^|\s|[^A-Z0-9/])' + re.escape(z) + r'(?:$|\s|[^A-Z0-9/])'
+        if re.search(pattern, cleaned_spaces):
             return z
     return ""
 
@@ -90,6 +104,49 @@ def parse_date_string(text: str) -> str:
 
     return ""
 
+def resolve_block_dates(weekly_sheet):
+    base_date_dt = None
+    for r_idx in range(min(20, len(weekly_sheet))):
+        row_data = weekly_sheet[r_idx]
+        for c_idx, cell in enumerate(row_data):
+            parsed = parse_date_string(cell)
+            if parsed:
+                try:
+                    found_dt = datetime.strptime(parsed, "%Y-%m-%d")
+                    b_idx = min(c_idx // 7, 6)
+                    base_date_dt = found_dt - timedelta(days=b_idx)
+                    break
+                except ValueError:
+                    pass
+        if base_date_dt:
+            break
+
+    if not base_date_dt:
+        today = datetime.now()
+        base_date_dt = today - timedelta(days=today.weekday())
+
+    block_dates = []
+    
+    for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
+        explicit_date = ""
+        for r_check in range(min(12, len(weekly_sheet))):
+            row_data = weekly_sheet[r_check]
+            for offset in range(7):
+                cell_idx = block_col + offset
+                if cell_idx < len(row_data):
+                    parsed = parse_date_string(row_data[cell_idx])
+                    if parsed:
+                        explicit_date = parsed
+                        break
+            if explicit_date: break
+
+        if explicit_date:
+            block_dates.append(explicit_date)
+        else:
+            block_dates.append((base_date_dt + timedelta(days=b_idx)).strftime("%Y-%m-%d"))
+
+    return block_dates
+
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "EM Shift Master Hub API Online"}
@@ -117,59 +174,44 @@ def sync_roster(user_name: str = Form(...)):
     try:
         weekly_sheet = fetch_sheet_csv("Weekly")
         if len(weekly_sheet) >= 1:
-            base_date_dt = None
-            for r_idx in range(min(20, len(weekly_sheet))):
-                row_data = weekly_sheet[r_idx]
-                for c_idx, cell in enumerate(row_data):
-                    parsed = parse_date_string(cell)
-                    if parsed:
-                        try:
-                            found_dt = datetime.strptime(parsed, "%Y-%m-%d")
-                            b_idx = min(c_idx // 7, 6)
-                            base_date_dt = found_dt - timedelta(days=b_idx)
-                            break
-                        except ValueError:
-                            pass
-                if base_date_dt:
-                    break
-
-            if not base_date_dt:
-                today = datetime.now()
-                base_date_dt = today - timedelta(days=today.weekday())
-
-            block_dates = [(base_date_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+            block_dates = resolve_block_dates(weekly_sheet)
 
             for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
                 assigned_date = block_dates[b_idx]
                 current_shift = "AM"
 
-                # Row 12 (0-indexed = 11) onwards strictly for shift labels & names
-                for r_idx in range(11, len(weekly_sheet)):
+                # Scan from Row 8 (0-indexed = 7) downwards so no top shift rows are missed
+                for r_idx in range(7, len(weekly_sheet)):
                     row = weekly_sheet[r_idx]
 
-                    # Shift label is strictly in block_col (Col A, H, O, V, AC, AJ, AQ)
-                    shift_cell = row[block_col].upper().strip()
-                    if shift_cell:
-                        if "AM" in shift_cell: current_shift = "AM"
-                        elif "PM" in shift_cell: current_shift = "PM"
-                        elif "NIGHT" in shift_cell or shift_cell == "N": current_shift = "N"
-                        elif "SD" in shift_cell or "S/D" in shift_cell: current_shift = "SD"
-                        elif "OD" in shift_cell or "O/D" in shift_cell: current_shift = "OD"
-                        elif "AL" in shift_cell: current_shift = "AL"
-                        elif "OL" in shift_cell: current_shift = "OL"
-                        elif "MC" in shift_cell: current_shift = "MC"
-                        elif "OFF" in shift_cell or "REST" in shift_cell: current_shift = "OFF"
-                        elif "LEAVE" in shift_cell: current_shift = "LEAVE"
+                    block_cells = [c.replace('\xa0', ' ').strip() for c in row[block_col : min(block_col + 7, len(row))]]
+                    block_text = " ".join(block_cells)
 
-                    # Name is strictly in block_col + 1 (Col B, I, P, W, AD, AK, AR)
-                    name_cell = row[block_col + 1]
-                    
-                    if match_exact_name(name_cell, weekly_name):
-                        # Zone is strictly in block_col + 2 (Col C, J, Q, X, AE, AL, AS)
-                        zone_cell = row[block_col + 2]
+                    # Update current_shift if ANY cell in the block contains a shift header
+                    for cell in block_cells:
+                        c_upper = cell.upper().strip()
+                        if c_upper:
+                            if "AM" in c_upper: current_shift = "AM"; break
+                            elif "PM" in c_upper: current_shift = "PM"; break
+                            elif "NIGHT" in c_upper or c_upper == "N": current_shift = "N"; break
+                            elif "SD" in c_upper or "S/D" in c_upper: current_shift = "SD"; break
+                            elif "OD" in c_upper or "O/D" in c_upper: current_shift = "OD"; break
+                            elif "AL" in c_upper: current_shift = "AL"; break
+                            elif "OL" in c_upper: current_shift = "OL"; break
+                            elif "MC" in c_upper: current_shift = "MC"; break
+                            elif "OFF" in c_upper or "REST" in c_upper: current_shift = "OFF"; break
+                            elif "LEAVE" in c_upper: current_shift = "LEAVE"; break
+
+                    if match_flexible_name(block_text, app_name, weekly_name):
                         detected_zone = ""
                         if current_shift in WORKING_SHIFTS:
-                            detected_zone = extract_zone(zone_cell) or extract_zone(name_cell)
+                            for cell in block_cells:
+                                z = extract_zone(cell)
+                                if z and not match_flexible_name(cell, app_name, weekly_name):
+                                    detected_zone = z
+                                    break
+                            if not detected_zone:
+                                detected_zone = extract_zone(block_text)
 
                         s_time, e_time = "08:00", "16:00"
                         if current_shift == 'PM': s_time, e_time = "14:00", "22:00"
@@ -229,7 +271,7 @@ def sync_roster(user_name: str = Form(...)):
                     elif "7" in t_left or "19" in t_left: last_time_left = ("19:00", "23:00")
 
                 left_names = " ".join(row[3:6])
-                if match_exact_name(left_names, locum_name) or match_exact_name(left_names, app_name):
+                if match_flexible_name(left_names, app_name, locum_name):
                     results.append({
                         "date": f"{target_year}-{target_month}-{last_date_left}",
                         "shift": "Locum",
@@ -254,7 +296,7 @@ def sync_roster(user_name: str = Form(...)):
                     elif "7" in t_right or "19" in t_right: last_time_right = ("19:00", "23:00")
 
                 right_names = " ".join(row[9:12])
-                if match_exact_name(right_names, locum_name) or match_exact_name(right_names, app_name):
+                if match_flexible_name(right_names, app_name, locum_name):
                     results.append({
                         "date": f"{target_year}-{target_month}-{last_date_right}",
                         "shift": "Locum",
