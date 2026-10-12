@@ -23,23 +23,38 @@ KNOWN_ZONES = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS',
 WORKING_SHIFTS = ['AM', 'PM', 'N', 'NIGHT']
 NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', 'OFF', 'REST', 'SL']
 
-# Mon(A=0), Tue(H=7), Wed(O=14), Thu(V=21), Fri(AC=28), Sat(AJ=35), Sun(AQ=42)
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
-    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}&t={int(time.time())}"
-    response = requests.get(url, timeout=10)
-    response.encoding = 'utf-8'
-    if response.status_code == 200:
-        rows = list(csv.reader(io.StringIO(response.text)))
-        padded_rows = []
-        for r in rows:
-            clean_r = [cell.replace('\xa0', ' ').strip() for cell in r]
-            if len(clean_r) < 50:
-                clean_r += [""] * (50 - len(clean_r))
-            padded_rows.append(clean_r)
-        return padded_rows
-    return []
+    # Try direct export URL first
+    url1 = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&sheet={tab_name}"
+    try:
+        r = requests.get(url1, timeout=10)
+        if r.status_code == 200 and len(r.text) > 20 and not r.text.strip().startswith("<!DOCTYPE"):
+            r.encoding = 'utf-8'
+            rows = list(csv.reader(io.StringIO(r.text)))
+            padded_rows = []
+            for row in rows:
+                clean_r = [cell.replace('\xa0', ' ').strip() for cell in row]
+                if len(clean_r) < 50:
+                    clean_r += [""] * (50 - len(clean_r))
+                padded_rows.append(clean_r)
+            return padded_rows
+    except Exception as e:
+        print(f"Direct export fetch error: {e}")
+
+    # Fallback to GViz query API
+    url2 = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}&t={int(time.time())}"
+    r = requests.get(url2, timeout=10)
+    r.encoding = 'utf-8'
+    rows = list(csv.reader(io.StringIO(r.text)))
+    padded_rows = []
+    for row in rows:
+        clean_r = [cell.replace('\xa0', ' ').strip() for cell in row]
+        if len(clean_r) < 50:
+            clean_r += [""] * (50 - len(clean_r))
+        padded_rows.append(clean_r)
+    return padded_rows
 
 def match_flexible_name(cell_text: str, app_name: str, weekly_name: str) -> bool:
     if not cell_text:
@@ -53,7 +68,7 @@ def match_flexible_name(cell_text: str, app_name: str, weekly_name: str) -> bool
         candidates.add(n_clean)
         words = n_clean.split()
         for w in words:
-            if len(w) >= 3:
+            if len(w) >= 2:
                 candidates.add(w)
                 
     for candidate in candidates:
@@ -109,13 +124,12 @@ def parse_date_string(text: str) -> str:
 def resolve_exact_block_dates(weekly_sheet):
     monday_dt = None
     
-    # Locate Monday date from Row 10 (index 9) Col B (index 1) or nearby cells
-    for r_check in [9, 8, 10, 7, 0, 1, 2]:
+    for r_check in [9, 8, 10, 7, 0, 1, 2, 3, 4, 5, 6, 11]:
         if r_check < len(weekly_sheet):
-            r = weekly_sheet[r_check]
-            for c in [1, 8, 15, 22, 29, 36, 43]:
-                if c < len(r):
-                    p = parse_date_string(r[c])
+            row = weekly_sheet[r_check]
+            for c in [1, 0, 2, 8, 15, 22, 29, 36, 43]:
+                if c < len(row):
+                    p = parse_date_string(row[c])
                     if p:
                         try:
                             dt = datetime.strptime(p, "%Y-%m-%d")
@@ -132,10 +146,10 @@ def resolve_exact_block_dates(weekly_sheet):
     block_dates = []
     for b_idx, b_col in enumerate(DAY_BLOCK_COLS):
         explicit_date = ""
-        for r_check in [9, 8, 10]:
+        for r_check in [9, 8, 10, 7]:
             if r_check < len(weekly_sheet):
                 r = weekly_sheet[r_check]
-                for offset in [1, 0, 2]:
+                for offset in range(7):
                     if b_col + offset < len(r):
                         parsed = parse_date_string(r[b_col + offset])
                         if parsed:
@@ -205,7 +219,6 @@ def sync_roster(user_name: str = Form(...)):
                         elif "OFF" in c_shift or "REST" in c_shift: current_shift = "OFF"
                         elif "LEAVE" in c_shift: current_shift = "LEAVE"
 
-                    # Check doctor name in Name cell (c_name) or adjacent block cells
                     combined_row_text = f"{c_shift} {c_name} {c_zone}".strip()
 
                     if match_flexible_name(c_name, app_name, weekly_name) or match_flexible_name(combined_row_text, app_name, weekly_name):
