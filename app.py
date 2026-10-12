@@ -23,6 +23,7 @@ KNOWN_ZONES = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS',
 WORKING_SHIFTS = ['AM', 'PM', 'N', 'NIGHT']
 NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', 'OFF', 'REST', 'SL']
 
+# Mon(A=0), Tue(H=7), Wed(O=14), Thu(V=21), Fri(AC=28), Sat(AJ=35), Sun(AQ=42)
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
@@ -105,31 +106,48 @@ def parse_date_string(text: str) -> str:
 
     return ""
 
-def resolve_block_dates(weekly_sheet):
-    monday_date_dt = None
+def resolve_exact_block_dates(weekly_sheet):
+    monday_dt = None
     
-    # Target Row 10 (index 9) or nearby header rows at Column B (index 1) for Monday's date
-    for r_check in [9, 8, 10, 7, 11, 0, 1, 2, 3, 4, 5, 6]:
+    # Locate Monday date from Row 10 (index 9) Col B (index 1) or nearby cells
+    for r_check in [9, 8, 10, 7, 0, 1, 2]:
         if r_check < len(weekly_sheet):
-            row = weekly_sheet[r_check]
-            for col_idx in [1, 0, 2, 8, 15]:
-                if col_idx < len(row):
-                    parsed = parse_date_string(row[col_idx])
-                    if parsed:
+            r = weekly_sheet[r_check]
+            for c in [1, 8, 15, 22, 29, 36, 43]:
+                if c < len(r):
+                    p = parse_date_string(r[c])
+                    if p:
                         try:
-                            dt = datetime.strptime(parsed, "%Y-%m-%d")
-                            b_idx = min(col_idx // 7, 6)
-                            monday_date_dt = dt - timedelta(days=b_idx)
+                            dt = datetime.strptime(p, "%Y-%m-%d")
+                            b_idx = min(c // 7, 6)
+                            monday_dt = dt - timedelta(days=b_idx)
                             break
                         except ValueError: pass
-            if monday_date_dt: break
+            if monday_dt: break
 
-    if not monday_date_dt:
+    if not monday_dt:
         today = datetime.now()
-        monday_date_dt = today - timedelta(days=today.weekday())
+        monday_dt = today - timedelta(days=today.weekday())
 
-    # Generate dates for Mon (0) through Sun (6)
-    block_dates = [(monday_date_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+    block_dates = []
+    for b_idx, b_col in enumerate(DAY_BLOCK_COLS):
+        explicit_date = ""
+        for r_check in [9, 8, 10]:
+            if r_check < len(weekly_sheet):
+                r = weekly_sheet[r_check]
+                for offset in [1, 0, 2]:
+                    if b_col + offset < len(r):
+                        parsed = parse_date_string(r[b_col + offset])
+                        if parsed:
+                            explicit_date = parsed
+                            break
+                if explicit_date: break
+                
+        if explicit_date:
+            block_dates.append(explicit_date)
+        else:
+            block_dates.append((monday_dt + timedelta(days=b_idx)).strftime("%Y-%m-%d"))
+
     return block_dates
 
 @app.get("/")
@@ -159,44 +177,41 @@ def sync_roster(user_name: str = Form(...)):
     try:
         weekly_sheet = fetch_sheet_csv("Weekly")
         if len(weekly_sheet) >= 1:
-            block_dates = resolve_block_dates(weekly_sheet)
+            block_dates = resolve_exact_block_dates(weekly_sheet)
 
             for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
                 assigned_date = block_dates[b_idx]
                 current_shift = "AM"
 
-                # Row 8 (0-indexed = 7) onwards strictly for shift labels & names
-                for r_idx in range(7, len(weekly_sheet)):
+                # Row 12 (0-indexed = 11) onwards strictly
+                for r_idx in range(11, len(weekly_sheet)):
                     row = weekly_sheet[r_idx]
+                    if not row: continue
 
-                    block_cells = [c.replace('\xa0', ' ').strip() for c in row[block_col : min(block_col + 7, len(row))]]
-                    block_text = " ".join(block_cells)
+                    c_shift = row[block_col].upper().strip()
+                    c_name = row[block_col + 1]
+                    c_zone = row[block_col + 2]
 
-                    # Shift label check
-                    for cell in block_cells:
-                        c_upper = cell.upper().strip()
-                        if c_upper:
-                            if "AM" in c_upper: current_shift = "AM"; break
-                            elif "PM" in c_upper: current_shift = "PM"; break
-                            elif "NIGHT" in c_upper or c_upper == "N": current_shift = "N"; break
-                            elif "SD" in c_upper or "S/D" in c_upper: current_shift = "SD"; break
-                            elif "OD" in c_upper or "O/D" in c_upper: current_shift = "OD"; break
-                            elif "AL" in c_upper: current_shift = "AL"; break
-                            elif "OL" in c_upper: current_shift = "OL"; break
-                            elif "MC" in c_upper: current_shift = "MC"; break
-                            elif "OFF" in c_upper or "REST" in c_upper: current_shift = "OFF"; break
-                            elif "LEAVE" in c_upper: current_shift = "LEAVE"; break
+                    # Shift label update
+                    if c_shift:
+                        if "AM" in c_shift: current_shift = "AM"
+                        elif "PM" in c_shift: current_shift = "PM"
+                        elif "NIGHT" in c_shift or c_shift == "N": current_shift = "N"
+                        elif "SD" in c_shift or "S/D" in c_shift: current_shift = "SD"
+                        elif "OD" in c_shift or "O/D" in c_shift: current_shift = "OD"
+                        elif "AL" in c_shift: current_shift = "AL"
+                        elif "OL" in c_shift: current_shift = "OL"
+                        elif "MC" in c_shift: current_shift = "MC"
+                        elif "OFF" in c_shift or "REST" in c_shift: current_shift = "OFF"
+                        elif "LEAVE" in c_shift: current_shift = "LEAVE"
 
-                    if match_flexible_name(block_text, app_name, weekly_name):
+                    # Check doctor name in Name cell (c_name) or adjacent block cells
+                    combined_row_text = f"{c_shift} {c_name} {c_zone}".strip()
+
+                    if match_flexible_name(c_name, app_name, weekly_name) or match_flexible_name(combined_row_text, app_name, weekly_name):
                         detected_zone = ""
                         if current_shift in WORKING_SHIFTS:
-                            for cell in block_cells:
-                                z = extract_zone(cell)
-                                if z and not match_flexible_name(cell, app_name, weekly_name):
-                                    detected_zone = z
-                                    break
-                            if not detected_zone:
-                                detected_zone = extract_zone(block_text)
+                            detected_zone = extract_zone(c_zone) or extract_zone(c_name) or extract_zone(combined_row_text)
 
                         s_time, e_time = "08:00", "16:00"
                         if current_shift == 'PM': s_time, e_time = "14:00", "22:00"
