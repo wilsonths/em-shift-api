@@ -26,35 +26,20 @@ NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', '
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
-    # Try direct export URL first
-    url1 = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&sheet={tab_name}"
-    try:
-        r = requests.get(url1, timeout=10)
-        if r.status_code == 200 and len(r.text) > 20 and not r.text.strip().startswith("<!DOCTYPE"):
-            r.encoding = 'utf-8'
-            rows = list(csv.reader(io.StringIO(r.text)))
-            padded_rows = []
-            for row in rows:
-                clean_r = [cell.replace('\xa0', ' ').strip() for cell in row]
-                if len(clean_r) < 50:
-                    clean_r += [""] * (50 - len(clean_r))
-                padded_rows.append(clean_r)
-            return padded_rows
-    except Exception as e:
-        print(f"Direct export fetch error: {e}")
-
-    # Fallback to GViz query API
-    url2 = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}&t={int(time.time())}"
-    r = requests.get(url2, timeout=10)
+    # GViz endpoint strictly respects &sheet=Weekly and &sheet=Locum
+    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}&t={int(time.time())}"
+    r = requests.get(url, timeout=10)
     r.encoding = 'utf-8'
-    rows = list(csv.reader(io.StringIO(r.text)))
-    padded_rows = []
-    for row in rows:
-        clean_r = [cell.replace('\xa0', ' ').strip() for cell in row]
-        if len(clean_r) < 50:
-            clean_r += [""] * (50 - len(clean_r))
-        padded_rows.append(clean_r)
-    return padded_rows
+    if r.status_code == 200:
+        rows = list(csv.reader(io.StringIO(r.text)))
+        padded_rows = []
+        for row in rows:
+            clean_r = [cell.replace('\xa0', ' ').strip() for cell in row]
+            if len(clean_r) < 50:
+                clean_r += [""] * (50 - len(clean_r))
+            padded_rows.append(clean_r)
+        return padded_rows
+    return []
 
 def match_flexible_name(cell_text: str, app_name: str, weekly_name: str) -> bool:
     if not cell_text:
@@ -164,6 +149,20 @@ def resolve_exact_block_dates(weekly_sheet):
 
     return block_dates
 
+def parse_locum_time_slot(time_str: str):
+    t_upper = time_str.upper().strip()
+    if not t_upper:
+        return ("19:00", "23:00")
+        
+    if any(k in t_upper for k in ["7PM", "7.00", "19:", "1900", "7-11", "11PM", "NIGHT", "EVE"]):
+        return ("19:00", "23:00")
+    elif any(k in t_upper for k in ["10AM", "10:", "1000", "10-2", "MORNING"]):
+        return ("10:00", "14:00")
+    elif any(k in t_upper for k in ["2PM", "14:", "1400", "2-6", "6PM", "AFTERNOON"]):
+        return ("14:00", "18:00")
+        
+    return ("19:00", "23:00")
+
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "EM Shift Master Hub API Online"}
@@ -197,7 +196,6 @@ def sync_roster(user_name: str = Form(...)):
                 assigned_date = block_dates[b_idx]
                 current_shift = "AM"
 
-                # Row 12 (0-indexed = 11) onwards strictly
                 for r_idx in range(11, len(weekly_sheet)):
                     row = weekly_sheet[r_idx]
                     if not row: continue
@@ -206,7 +204,6 @@ def sync_roster(user_name: str = Form(...)):
                     c_name = row[block_col + 1]
                     c_zone = row[block_col + 2]
 
-                    # Shift label update
                     if c_shift:
                         if "AM" in c_shift: current_shift = "AM"
                         elif "PM" in c_shift: current_shift = "PM"
@@ -278,10 +275,7 @@ def sync_roster(user_name: str = Form(...)):
                         if 1 <= val <= 31: last_date_left = str(val).zfill(2)
 
                 if row[2].strip():
-                    t_left = row[2].upper()
-                    if "10" in t_left: last_time_left = ("10:00", "14:00")
-                    elif "2" in t_left: last_time_left = ("14:00", "18:00")
-                    elif "7" in t_left or "19" in t_left: last_time_left = ("19:00", "23:00")
+                    last_time_left = parse_locum_time_slot(row[2])
 
                 left_names = " ".join(row[3:6])
                 if match_flexible_name(left_names, app_name, locum_name):
@@ -303,10 +297,7 @@ def sync_roster(user_name: str = Form(...)):
                         if 1 <= val_r <= 31: last_date_right = str(val_r).zfill(2)
 
                 if row[8].strip():
-                    t_right = row[8].upper()
-                    if "10" in t_right: last_time_right = ("10:00", "14:00")
-                    elif "2" in t_right: last_time_right = ("14:00", "18:00")
-                    elif "7" in t_right or "19" in t_right: last_time_right = ("19:00", "23:00")
+                    last_time_right = parse_locum_time_slot(row[8])
 
                 right_names = " ".join(row[9:12])
                 if match_flexible_name(right_names, app_name, locum_name):
