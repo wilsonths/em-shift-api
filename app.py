@@ -22,12 +22,10 @@ SHEET_ID = "1tNxIC97VlR1LKxRIqoKHpJnzcssua_FTH8Y1wLEp6cg"
 KNOWN_ZONES = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS', 'Y']
 WORKING_SHIFTS = ['AM', 'PM', 'N', 'NIGHT']
 NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', 'OFF', 'REST', 'SL']
-
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
-    # GViz endpoint strictly respects &sheet=Weekly and &sheet=Locum
-    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}&t={int(time.time())}"
+    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}&t={int(time.time_ns())}"
     r = requests.get(url, timeout=10)
     r.encoding = 'utf-8'
     if r.status_code == 200:
@@ -42,8 +40,7 @@ def fetch_sheet_csv(tab_name: str):
     return []
 
 def match_flexible_name(cell_text: str, app_name: str, weekly_name: str) -> bool:
-    if not cell_text:
-        return False
+    if not cell_text: return False
     cleaned_cell = re.sub(r'[^A-Z0-9\s]', ' ', cell_text.upper())
     
     candidates = set()
@@ -51,8 +48,7 @@ def match_flexible_name(cell_text: str, app_name: str, weekly_name: str) -> bool
         if not n: continue
         n_clean = n.upper().strip()
         candidates.add(n_clean)
-        words = n_clean.split()
-        for w in words:
+        for w in n_clean.split():
             if len(w) >= 2:
                 candidates.add(w)
                 
@@ -60,55 +56,33 @@ def match_flexible_name(cell_text: str, app_name: str, weekly_name: str) -> bool
         pattern = r'(?:^|\s)' + re.escape(candidate) + r'(?:\s|$)'
         if re.search(pattern, cleaned_cell):
             return True
-            
     return False
 
 def extract_zone(text: str) -> str:
     if not text: return ""
-    text_upper = text.upper().strip()
-    cleaned_spaces = re.sub(r'[^A-Z0-9/]', ' ', text_upper)
+    cleaned_spaces = re.sub(r'[^A-Z0-9/]', ' ', text.upper().strip())
     for z in KNOWN_ZONES:
-        pattern = r'(?:^|\s|[^A-Z0-9/])' + re.escape(z) + r'(?:$|\s|[^A-Z0-9/])'
-        if re.search(pattern, cleaned_spaces):
+        if re.search(r'(?:^|\s|[^A-Z0-9/])' + re.escape(z) + r'(?:$|\s|[^A-Z0-9/])', cleaned_spaces):
             return z
     return ""
 
 def parse_date_string(text: str) -> str:
     if not text: return ""
     text = text.strip()
-
     m = re.search(r'Date\((\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\)', text)
     if m:
-        y = int(m.group(1))
-        m_idx = int(m.group(2)) + 1
-        d = int(m.group(3))
-        return f"{y:04d}-{m_idx:02d}-{d:02d}"
-
+        return f"{int(m.group(1)):04d}-{int(m.group(2))+1:02d}-{int(m.group(3)):02d}"
     m = re.search(r'\b(20\d\d)[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12][0-9]|3[01])\b', text)
     if m:
         return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
-
     m = re.search(r'\b(0?[1-9]|[12][0-9]|3[01])[/.-](0?[1-9]|1[0-2])(?:[/.-](20\d\d|\d\d))?\b', text)
     if m:
-        day = m.group(1).zfill(2)
-        month = m.group(2).zfill(2)
-        raw_year = m.group(3)
-        year = raw_year if (raw_year and len(raw_year) == 4) else ("20" + raw_year if raw_year else "2026")
-        return f"{year}-{month}-{day}"
-
-    m = re.search(r'\b(0?[1-9]|[12][0-9]|3[01])[\s\-_](JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-z]*\b', text, re.IGNORECASE)
-    if m:
-        day = m.group(1).zfill(2)
-        m_str = m.group(2).upper()
-        months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
-        month = str(months.index(m_str) + 1).zfill(2)
-        return f"2026-{month}-{day}"
-
+        year = m.group(3) if (m.group(3) and len(m.group(3)) == 4) else ("20" + m.group(3) if m.group(3) else "2026")
+        return f"{year}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
     return ""
 
 def resolve_exact_block_dates(weekly_sheet):
     monday_dt = None
-    
     for r_check in [9, 8, 10, 7, 0, 1, 2, 3, 4, 5, 6, 11]:
         if r_check < len(weekly_sheet):
             row = weekly_sheet[r_check]
@@ -118,8 +92,7 @@ def resolve_exact_block_dates(weekly_sheet):
                     if p:
                         try:
                             dt = datetime.strptime(p, "%Y-%m-%d")
-                            b_idx = min(c // 7, 6)
-                            monday_dt = dt - timedelta(days=b_idx)
+                            monday_dt = dt - timedelta(days=min(c // 7, 6))
                             break
                         except ValueError: pass
             if monday_dt: break
@@ -141,7 +114,6 @@ def resolve_exact_block_dates(weekly_sheet):
                             explicit_date = parsed
                             break
                 if explicit_date: break
-                
         if explicit_date:
             block_dates.append(explicit_date)
         else:
@@ -151,29 +123,18 @@ def resolve_exact_block_dates(weekly_sheet):
 
 def parse_locum_time_slot(time_str: str):
     t_upper = time_str.upper().strip()
-    if not t_upper:
-        return ("19:00", "23:00")
-        
+    if not t_upper: return ("19:00", "23:00")
     if any(k in t_upper for k in ["7PM", "7.00", "19:", "1900", "7-11", "11PM", "NIGHT", "EVE"]):
         return ("19:00", "23:00")
     elif any(k in t_upper for k in ["10AM", "10:", "1000", "10-2", "MORNING"]):
         return ("10:00", "14:00")
     elif any(k in t_upper for k in ["2PM", "14:", "1400", "2-6", "6PM", "AFTERNOON"]):
         return ("14:00", "18:00")
-        
     return ("19:00", "23:00")
 
-@app.get("/")
-def health_check():
-    return {"status": "ok", "message": "EM Shift Master Hub API Online"}
-
-@app.post("/sync-roster")
-def sync_roster(user_name: str = Form(...)):
-    app_name = user_name.upper().strip()
+def get_user_aliases(app_name: str):
     weekly_name = app_name
     locum_name = app_name
-
-    # 1. READ ALIASES TAB
     try:
         aliases_sheet = fetch_sheet_csv("Aliases")
         for row in aliases_sheet[1:]:
@@ -182,11 +143,19 @@ def sync_roster(user_name: str = Form(...)):
                 locum_name = row[2].upper().strip()
                 break
     except Exception as e:
-        print(f"Aliases tab read error: {e}")
+        print("Aliases read error:", e)
+    return weekly_name, locum_name
 
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "EM Shift API Online"}
+
+@app.post("/sync-weekly")
+def sync_weekly(user_name: str = Form(...)):
+    app_name = user_name.upper().strip()
+    weekly_name, _ = get_user_aliases(app_name)
     results = []
 
-    # 2. READ WEEKLY SHIFT TAB
     try:
         weekly_sheet = fetch_sheet_csv("Weekly")
         if len(weekly_sheet) >= 1:
@@ -216,12 +185,11 @@ def sync_roster(user_name: str = Form(...)):
                         elif "OFF" in c_shift or "REST" in c_shift: current_shift = "OFF"
                         elif "LEAVE" in c_shift: current_shift = "LEAVE"
 
-                    combined_row_text = f"{c_shift} {c_name} {c_zone}".strip()
-
-                    if match_flexible_name(c_name, app_name, weekly_name) or match_flexible_name(combined_row_text, app_name, weekly_name):
+                    combined = f"{c_shift} {c_name} {c_zone}".strip()
+                    if match_flexible_name(c_name, app_name, weekly_name) or match_flexible_name(combined, app_name, weekly_name):
                         detected_zone = ""
                         if current_shift in WORKING_SHIFTS:
-                            detected_zone = extract_zone(c_zone) or extract_zone(c_name) or extract_zone(combined_row_text)
+                            detected_zone = extract_zone(c_zone) or extract_zone(c_name) or extract_zone(combined)
 
                         s_time, e_time = "08:00", "16:00"
                         if current_shift == 'PM': s_time, e_time = "14:00", "22:00"
@@ -238,11 +206,18 @@ def sync_roster(user_name: str = Form(...)):
                             "isLocum": False
                         })
                         break
-
     except Exception as e:
-        print(f"Weekly Sheet Error: {e}")
+        print("Weekly Sheet Error:", e)
 
-    # 3. READ MONTHLY LOCUM TAB
+    results.sort(key=lambda x: x['date'])
+    return {"status": "success", "count": len(results), "data": results}
+
+@app.post("/sync-locum")
+def sync_locum(user_name: str = Form(...)):
+    app_name = user_name.upper().strip()
+    _, locum_name = get_user_aliases(app_name)
+    results = []
+
     try:
         locum_sheet = fetch_sheet_csv("Locum")
         if len(locum_sheet) > 0:
@@ -267,7 +242,7 @@ def sync_roster(user_name: str = Form(...)):
             last_time_right = ("19:00", "23:00")
 
             for row in locum_sheet[1:]:
-                # LEFT BLOCK (Days 1–15)
+                # LEFT BLOCK
                 if row[0].strip():
                     d_left = re.search(r'\b([1-3]?[0-9])\b', row[0])
                     if d_left:
@@ -289,7 +264,7 @@ def sync_roster(user_name: str = Form(...)):
                         "isLocum": True
                     })
 
-                # RIGHT BLOCK (Days 16–31)
+                # RIGHT BLOCK
                 if row[6].strip():
                     d_right = re.search(r'\b([1-3]?[0-9])\b', row[6])
                     if d_right:
@@ -310,9 +285,16 @@ def sync_roster(user_name: str = Form(...)):
                         "facilityName": "ED Department Locum",
                         "isLocum": True
                     })
-
     except Exception as e:
-        print(f"Locum Sheet Error: {e}")
+        print("Locum Sheet Error:", e)
 
     results.sort(key=lambda x: x['date'])
     return {"status": "success", "count": len(results), "data": results}
+
+@app.post("/sync-roster")
+def sync_roster(user_name: str = Form(...)):
+    res_w = sync_weekly(user_name)
+    res_l = sync_locum(user_name)
+    combined = res_w.get("data", []) + res_l.get("data", [])
+    combined.sort(key=lambda x: x['date'])
+    return {"status": "success", "count": len(combined), "data": combined}
