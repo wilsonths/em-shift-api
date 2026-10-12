@@ -25,6 +25,7 @@ NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', '
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
+    # GViz query with timestamp parameter ensures fresh data for exact tab
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}&t={int(time.time_ns())}"
     r = requests.get(url, timeout=10)
     r.encoding = 'utf-8'
