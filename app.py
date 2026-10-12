@@ -67,19 +67,46 @@ def extract_zone(text: str) -> str:
             return z
     return ""
 
+
 def parse_date_string(text: str) -> str:
-    if not text: return ""
+    if not text:
+        return ""
+
     text = text.strip()
-    m = re.search(r'Date\((\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\)', text)
+
+    # Google Visualization date format: Date(2026,9,14)
+    m = re.search(
+        r'Date\(\s*(\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\s*\)',
+        text,
+        re.IGNORECASE
+    )
     if m:
-        return f"{int(m.group(1)):04d}-{int(m.group(2))+1:02d}-{int(m.group(3)):02d}"
-    m = re.search(r'\b(20\d\d)[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12][0-9]|3[01])\b', text)
-    if m:
-        return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
-    m = re.search(r'\b(0?[1-9]|[12][0-9]|3[01])[/.-](0?[1-9]|1[0-2])(?:[/.-](20\d\d|\d\d))?\b', text)
-    if m:
-        year = m.group(3) if (m.group(3) and len(m.group(3)) == 4) else ("20" + m.group(3) if m.group(3) else "2026")
-        return f"{year}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
+        try:
+            dt = datetime(
+                int(m.group(1)),
+                int(m.group(2)) + 1,
+                int(m.group(3))
+            )
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            return ""
+
+    # Standard date formats
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y",
+                "%d.%m.%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
+    # Dates without a year; retain your existing 2026 default
+    for fmt in ("%d/%m", "%d-%m", "%d.%m"):
+        try:
+            dt = datetime.strptime(text, fmt).replace(year=2026)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+
     return ""
 
 def get_weekly_dates(weekly_sheet):
@@ -144,62 +171,146 @@ def get_user_aliases(app_name: str):
         print("Aliases read error:", e)
     return weekly_name, locum_name
 
+
 def extract_weekly_shifts(app_name: str, weekly_name: str):
     weekly_results = []
+
     try:
         weekly_sheet = fetch_sheet_csv("Weekly")
-        if len(weekly_sheet) >= 1:
-            block_dates = get_weekly_dates(weekly_sheet)
 
-            for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
-                assigned_date = block_dates[b_idx]
-                current_shift = "AM"
+        print("\n========== WEEKLY ROSTER DEBUG ==========")
+        print("Rows fetched:", len(weekly_sheet))
+        print("App name:", repr(app_name))
+        print("Weekly alias:", repr(weekly_name))
 
-                # Start scanning early at Row 8 (index 7) to catch top rows like AUNI and JOVI
-                for r_idx in range(7, len(weekly_sheet)):
-                    row = weekly_sheet[r_idx]
-                    if not row: continue
+        if not weekly_sheet:
+            print("ERROR: Weekly sheet returned no rows.")
+            return weekly_results
 
-                    c_shift = row[block_col].upper().strip()
-                    c_name = row[block_col + 1]
-                    c_zone = row[block_col + 2]
+        # Diagnostic: spreadsheet row 10, Python index 9
+        if len(weekly_sheet) > 9:
+            date_row = weekly_sheet[9]
+            print("Date row, spreadsheet row 10:")
+            print([
+                (i, repr(value))
+                for i, value in enumerate(date_row)
+                if value.strip()
+            ])
 
-                    # Update current_shift on every row
-                    if c_shift:
-                        if "AM" in c_shift: current_shift = "AM"
-                        elif "PM" in c_shift: current_shift = "PM"
-                        elif "NIGHT" in c_shift or c_shift == "N": current_shift = "N"
-                        elif "SD" in c_shift or "S/D" in c_shift: current_shift = "SD"
-                        elif "OD" in c_shift or "O/D" in c_shift: current_shift = "OD"
-                        elif "AL" in c_shift: current_shift = "AL"
-                        elif "OL" in c_shift: current_shift = "OL"
-                        elif "MC" in c_shift: current_shift = "MC"
-                        elif "OFF" in c_shift or "REST" in c_shift: current_shift = "OFF"
-                        elif "LEAVE" in c_shift: current_shift = "LEAVE"
+        # Diagnostic: Wednesday columns O, P, Q
+        # Spreadsheet rows 12-14 = Python indices 11-13
+        for r_idx in range(11, min(14, len(weekly_sheet))):
+            row = weekly_sheet[r_idx]
+            print(
+                f"Spreadsheet row {r_idx + 1}:",
+                "O/Shift =", repr(row[14]),
+                "P/Name =", repr(row[15]),
+                "Q/Zone =", repr(row[16]),
+                "Name match =",
+                match_flexible_name(
+                    row[15], app_name, weekly_name
+                )
+            )
 
-                    combined = f"{c_shift} {c_name} {c_zone}".strip()
-                    if match_flexible_name(c_name, app_name, weekly_name) or match_flexible_name(combined, app_name, weekly_name):
-                        detected_zone = ""
-                        if current_shift in WORKING_SHIFTS:
-                            detected_zone = extract_zone(c_zone) or extract_zone(c_name) or extract_zone(combined)
+        block_dates = get_weekly_dates(weekly_sheet)
+        print("Calculated dates Monday-Sunday:", block_dates)
 
-                        s_time, e_time = "08:00", "16:00"
-                        if current_shift == 'PM': s_time, e_time = "14:00", "22:00"
-                        elif current_shift in ['N', 'NIGHT']: s_time, e_time = "21:00", "09:00"
-                        elif current_shift in NO_ZONE_SHIFTS: s_time, e_time = "", ""
+        for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
+            assigned_date = block_dates[b_idx]
+            current_shift = "AM"
 
-                        weekly_results.append({
-                            "date": assigned_date,
-                            "shift": current_shift,
-                            "zone": detected_zone,
-                            "assignmentType": current_shift,
-                            "startTime": s_time,
-                            "endTime": e_time,
-                            "isLocum": False
-                        })
-                        break
+            # Actual roster data begins at spreadsheet row 12
+            for r_idx in range(11, len(weekly_sheet)):
+                row = weekly_sheet[r_idx]
+
+                c_shift = row[block_col].upper().strip()
+                c_name = row[block_col + 1].strip()
+                c_zone = row[block_col + 2].strip()
+
+                if c_shift:
+                    if "AM" in c_shift:
+                        current_shift = "AM"
+                    elif "PM" in c_shift:
+                        current_shift = "PM"
+                    elif "NIGHT" in c_shift or c_shift == "N":
+                        current_shift = "N"
+                    elif "SD" in c_shift or "S/D" in c_shift:
+                        current_shift = "SD"
+                    elif "OD" in c_shift or "O/D" in c_shift:
+                        current_shift = "OD"
+                    elif c_shift == "AL":
+                        current_shift = "AL"
+                    elif c_shift == "OL":
+                        current_shift = "OL"
+                    elif c_shift == "MC":
+                        current_shift = "MC"
+                    elif "OFF" in c_shift or "REST" in c_shift:
+                        current_shift = "OFF"
+                    elif "LEAVE" in c_shift:
+                        current_shift = "LEAVE"
+
+                # Match the name cell and log the decision
+                matched = (
+                    match_flexible_name(
+                        c_name, app_name, weekly_name
+                    )
+                    or match_flexible_name(
+                        f"{c_shift} {c_name} {c_zone}",
+                        app_name,
+                        weekly_name
+                    )
+                )
+
+                if b_idx == 2 and (
+                    "JOVI" in c_name.upper()
+                    or app_name == "JOVI"
+                ):
+                    print(
+                        f"Wednesday candidate, row {r_idx + 1}:",
+                        "shift =", repr(c_shift),
+                        "name =", repr(c_name),
+                        "zone =", repr(c_zone),
+                        "current_shift =", repr(current_shift),
+                        "matched =", matched
+                    )
+
+                if not matched:
+                    continue
+
+                detected_zone = ""
+                if current_shift in WORKING_SHIFTS:
+                    detected_zone = (
+                        extract_zone(c_zone)
+                        or extract_zone(c_name)
+                    )
+
+                s_time, e_time = "08:00", "16:00"
+
+                if current_shift == "PM":
+                    s_time, e_time = "14:00", "22:00"
+                elif current_shift in ("N", "NIGHT"):
+                    s_time, e_time = "21:00", "09:00"
+                elif current_shift in NO_ZONE_SHIFTS:
+                    s_time, e_time = "", ""
+
+                weekly_results.append({
+                    "date": assigned_date,
+                    "shift": current_shift,
+                    "zone": detected_zone,
+                    "assignmentType": current_shift,
+                    "startTime": s_time,
+                    "endTime": e_time,
+                    "isLocum": False
+                })
+
+                break
+
     except Exception as e:
-        print("Weekly Sheet Error:", e)
+        print("Weekly Sheet Error:", repr(e))
+
+    print("Weekly assignments found:", len(weekly_results))
+    print("========== END WEEKLY DEBUG ==========\n")
+
     return weekly_results
 
 def extract_locum_shifts(app_name: str, locum_name: str):
