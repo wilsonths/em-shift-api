@@ -22,7 +22,6 @@ SHEET_ID = "1tNxIC97VlR1LKxRIqoKHpJnzcssua_FTH8Y1wLEp6cg"
 KNOWN_ZONES = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS', 'Y']
 WORKING_SHIFTS = ['AM', 'PM', 'N', 'NIGHT']
 NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', 'OFF', 'REST', 'SL']
-
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
@@ -84,8 +83,6 @@ def parse_date_string(text: str) -> str:
 
 def get_weekly_dates(weekly_sheet):
     monday_dt = None
-    
-    # 1. Target Monday Date on Row 10 (index 9) Col B (index 1) or Col A (index 0)
     for r_idx in [9, 8, 10, 7, 11, 0, 1, 2, 3, 4, 5, 6]:
         if r_idx < len(weekly_sheet):
             row = weekly_sheet[r_idx]
@@ -99,24 +96,10 @@ def get_weekly_dates(weekly_sheet):
                         except ValueError: pass
             if monday_dt: break
 
-    # 2. Search anywhere on Row 10 (index 9) if not found at Col A/B
-    if not monday_dt and len(weekly_sheet) > 9:
-        row_10 = weekly_sheet[9]
-        for c_idx, cell in enumerate(row_10):
-            parsed = parse_date_string(cell)
-            if parsed:
-                try:
-                    dt = datetime.strptime(parsed, "%Y-%m-%d")
-                    b_idx = min(c_idx // 7, 6)
-                    monday_dt = dt - timedelta(days=b_idx)
-                    break
-                except ValueError: pass
-
     if not monday_dt:
         today = datetime.now()
         monday_dt = today - timedelta(days=today.weekday())
 
-    # Generate 7 exact dates for Mon -> Sun
     return [(monday_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
 
 def parse_locum_time_slot(time_str: str):
@@ -144,16 +127,8 @@ def get_user_aliases(app_name: str):
         print("Aliases read error:", e)
     return weekly_name, locum_name
 
-@app.get("/")
-def health_check():
-    return {"status": "ok", "message": "EM Shift API Online"}
-
-@app.post("/sync-weekly")
-def sync_weekly(user_name: str = Form(...)):
-    app_name = user_name.upper().strip()
-    weekly_name, _ = get_user_aliases(app_name)
-    results = []
-
+def extract_weekly_shifts(app_name: str, weekly_name: str):
+    weekly_results = []
     try:
         weekly_sheet = fetch_sheet_csv("Weekly")
         if len(weekly_sheet) >= 1:
@@ -194,7 +169,7 @@ def sync_weekly(user_name: str = Form(...)):
                         elif current_shift in ['N', 'NIGHT']: s_time, e_time = "21:00", "09:00"
                         elif current_shift in NO_ZONE_SHIFTS: s_time, e_time = "", ""
 
-                        results.append({
+                        weekly_results.append({
                             "date": assigned_date,
                             "shift": current_shift,
                             "zone": detected_zone,
@@ -206,16 +181,10 @@ def sync_weekly(user_name: str = Form(...)):
                         break
     except Exception as e:
         print("Weekly Sheet Error:", e)
+    return weekly_results
 
-    results.sort(key=lambda x: x['date'])
-    return {"status": "success", "count": len(results), "data": results}
-
-@app.post("/sync-locum")
-def sync_locum(user_name: str = Form(...)):
-    app_name = user_name.upper().strip()
-    _, locum_name = get_user_aliases(app_name)
-    results = []
-
+def extract_locum_shifts(app_name: str, locum_name: str):
+    locum_results = []
     try:
         locum_sheet = fetch_sheet_csv("Locum")
         if len(locum_sheet) > 0:
@@ -252,7 +221,7 @@ def sync_locum(user_name: str = Form(...)):
 
                 left_names = " ".join(row[3:6])
                 if match_flexible_name(left_names, app_name, locum_name):
-                    results.append({
+                    locum_results.append({
                         "date": f"{target_year}-{target_month}-{last_date_left}",
                         "shift": "Locum",
                         "assignmentType": "Internal Locum",
@@ -274,7 +243,7 @@ def sync_locum(user_name: str = Form(...)):
 
                 right_names = " ".join(row[9:12])
                 if match_flexible_name(right_names, app_name, locum_name):
-                    results.append({
+                    locum_results.append({
                         "date": f"{target_year}-{target_month}-{last_date_right}",
                         "shift": "Locum",
                         "assignmentType": "Internal Locum",
@@ -285,14 +254,37 @@ def sync_locum(user_name: str = Form(...)):
                     })
     except Exception as e:
         print("Locum Sheet Error:", e)
+    return locum_results
 
-    results.sort(key=lambda x: x['date'])
-    return {"status": "success", "count": len(results), "data": results}
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "EM Shift API Online"}
 
 @app.post("/sync-roster")
 def sync_roster(user_name: str = Form(...)):
-    res_w = sync_weekly(user_name)
-    res_l = sync_locum(user_name)
-    combined = res_w.get("data", []) + res_l.get("data", [])
+    app_name = user_name.upper().strip()
+    weekly_name, locum_name = get_user_aliases(app_name)
+    
+    # Process isolated functions with completely distinct local scopes
+    weekly_data = extract_weekly_shifts(app_name, weekly_name)
+    locum_data = extract_locum_shifts(app_name, locum_name)
+    
+    combined = weekly_data + locum_data
     combined.sort(key=lambda x: x['date'])
     return {"status": "success", "count": len(combined), "data": combined}
+
+@app.post("/sync-weekly")
+def sync_weekly(user_name: str = Form(...)):
+    app_name = user_name.upper().strip()
+    weekly_name, _ = get_user_aliases(app_name)
+    weekly_data = extract_weekly_shifts(app_name, weekly_name)
+    weekly_data.sort(key=lambda x: x['date'])
+    return {"status": "success", "count": len(weekly_data), "data": weekly_data}
+
+@app.post("/sync-locum")
+def sync_locum(user_name: str = Form(...)):
+    app_name = user_name.upper().strip()
+    _, locum_name = get_user_aliases(app_name)
+    locum_data = extract_locum_shifts(app_name, locum_name)
+    locum_data.sort(key=lambda x: x['date'])
+    return {"status": "success", "count": len(locum_data), "data": locum_data}
