@@ -22,10 +22,10 @@ SHEET_ID = "1tNxIC97VlR1LKxRIqoKHpJnzcssua_FTH8Y1wLEp6cg"
 KNOWN_ZONES = ['Y/TL', 'R2A', 'R2B', 'Y/C', 'REG', 'R1', 'YS', 'Y2', 'GZ', 'GS', 'Y']
 WORKING_SHIFTS = ['AM', 'PM', 'N', 'NIGHT']
 NO_ZONE_SHIFTS = ['SD', 'OD', 'AL', 'MC', 'OH', 'AD', 'COURSE', 'OL', 'LEAVE', 'OFF', 'REST', 'SL']
+
 DAY_BLOCK_COLS = [0, 7, 14, 21, 28, 35, 42]
 
 def fetch_sheet_csv(tab_name: str):
-    # GViz query with timestamp parameter ensures fresh data for exact tab
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={tab_name}&t={int(time.time_ns())}"
     r = requests.get(url, timeout=10)
     r.encoding = 'utf-8'
@@ -82,45 +82,42 @@ def parse_date_string(text: str) -> str:
         return f"{year}-{m.group(2).zfill(2)}-{m.group(1).zfill(2)}"
     return ""
 
-def resolve_exact_block_dates(weekly_sheet):
+def get_weekly_dates(weekly_sheet):
     monday_dt = None
-    for r_check in [9, 8, 10, 7, 0, 1, 2, 3, 4, 5, 6, 11]:
-        if r_check < len(weekly_sheet):
-            row = weekly_sheet[r_check]
-            for c in [1, 0, 2, 8, 15, 22, 29, 36, 43]:
-                if c < len(row):
-                    p = parse_date_string(row[c])
-                    if p:
+    
+    # 1. Target Monday Date on Row 10 (index 9) Col B (index 1) or Col A (index 0)
+    for r_idx in [9, 8, 10, 7, 11, 0, 1, 2, 3, 4, 5, 6]:
+        if r_idx < len(weekly_sheet):
+            row = weekly_sheet[r_idx]
+            for col_idx in [1, 0, 2]:
+                if col_idx < len(row):
+                    parsed = parse_date_string(row[col_idx])
+                    if parsed:
                         try:
-                            dt = datetime.strptime(p, "%Y-%m-%d")
-                            monday_dt = dt - timedelta(days=min(c // 7, 6))
+                            monday_dt = datetime.strptime(parsed, "%Y-%m-%d")
                             break
                         except ValueError: pass
             if monday_dt: break
+
+    # 2. Search anywhere on Row 10 (index 9) if not found at Col A/B
+    if not monday_dt and len(weekly_sheet) > 9:
+        row_10 = weekly_sheet[9]
+        for c_idx, cell in enumerate(row_10):
+            parsed = parse_date_string(cell)
+            if parsed:
+                try:
+                    dt = datetime.strptime(parsed, "%Y-%m-%d")
+                    b_idx = min(c_idx // 7, 6)
+                    monday_dt = dt - timedelta(days=b_idx)
+                    break
+                except ValueError: pass
 
     if not monday_dt:
         today = datetime.now()
         monday_dt = today - timedelta(days=today.weekday())
 
-    block_dates = []
-    for b_idx, b_col in enumerate(DAY_BLOCK_COLS):
-        explicit_date = ""
-        for r_check in [9, 8, 10, 7]:
-            if r_check < len(weekly_sheet):
-                r = weekly_sheet[r_check]
-                for offset in range(7):
-                    if b_col + offset < len(r):
-                        parsed = parse_date_string(r[b_col + offset])
-                        if parsed:
-                            explicit_date = parsed
-                            break
-                if explicit_date: break
-        if explicit_date:
-            block_dates.append(explicit_date)
-        else:
-            block_dates.append((monday_dt + timedelta(days=b_idx)).strftime("%Y-%m-%d"))
-
-    return block_dates
+    # Generate 7 exact dates for Mon -> Sun
+    return [(monday_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
 
 def parse_locum_time_slot(time_str: str):
     t_upper = time_str.upper().strip()
@@ -160,7 +157,7 @@ def sync_weekly(user_name: str = Form(...)):
     try:
         weekly_sheet = fetch_sheet_csv("Weekly")
         if len(weekly_sheet) >= 1:
-            block_dates = resolve_exact_block_dates(weekly_sheet)
+            block_dates = get_weekly_dates(weekly_sheet)
 
             for b_idx, block_col in enumerate(DAY_BLOCK_COLS):
                 assigned_date = block_dates[b_idx]
